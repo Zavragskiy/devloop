@@ -1,0 +1,26 @@
+[project]
+name = "devloop"
+version = "0.1.0"
+description = "Fast, configurable verification loop for Python projects"
+authors = [{ name = "Devloop contributors" }]
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = []
+
+[project.scripts]
+devloop = "devloop.cli:main"
+
+[tool.poetry]
+packages = [{ include = "devloop", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0"
+ruff = "^0.15"
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+

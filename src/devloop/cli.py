@@ -234,7 +234,10 @@ def _run_check(
     """Run one ``[[tool.devloop.check]]`` command with the paths it asked for."""
     if spec.paths == "changed":
         if not files:
-            print(f"[verify] {spec.name}: skipped (no changed files)")
+            print(
+                f"[verify] {spec.name}: skipped (no changed files; "
+                'use paths = "all" for the whole tree)'
+            )
             return
         targets = list(files)
     else:
@@ -500,7 +503,9 @@ def run_baseline(args: argparse.Namespace) -> int:
     if cfg.baseline is None:
         raise ValueError('the baseline is disabled by [tool.devloop] baseline = ""')
     quiet = frozenset({"ruff", "format", "mypy"})
-    steps = Steps(cfg, keep_going=False, quiet=quiet)
+    # Collecting is not gating: a step that reports findings is expected to exit
+    # nonzero, and stopping there would drop every later step from the file.
+    steps = Steps(cfg, keep_going=True, quiet=quiet)
     observed = _collect_findings(cfg, steps)
     if observed is None:
         return 2

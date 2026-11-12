@@ -927,6 +927,12 @@ class ExtraCheckTest(unittest.TestCase):
         cli._static_steps(self._config("changed"), steps, [], full=False)
         self.assertNotIn("plan-run", [label for label, _ in steps.commands])
 
+    def test_a_skipped_changed_check_says_how_to_widen_it(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            cli._static_steps(self._config("changed"), RecordingSteps(), [], full=True)
+        self.assertIn('paths = "all"', output.getvalue())
+
     def test_a_failing_check_fails_the_pipeline(self) -> None:
         steps = RecordingSteps()
         steps.failures.append("plan-run")
@@ -938,15 +944,25 @@ class ScriptedSteps(cli.Steps):
     """A ``Steps`` that answers with canned output instead of running tools."""
 
     ruff_output = "[]"
+    reported: dict[str, list[findings.Finding]] = {}
+    failing: set[str] = set()
 
     def __init__(self, cfg: config.Config, keep_going: bool, quiet: frozenset[str] = frozenset()):
         super().__init__(cfg, keep_going, quiet)
         self.ran = set()
+        self.reported = dict(type(self).reported)
+        self.failing = set(type(self).failing)
 
     def run(self, label: str, command: list[str] | None) -> bool:
         self.ran.add(label)
         self.outputs[label] = self.ruff_output if label == "ruff" else ""
+        if label in self.failing:
+            self.failures.append(label)
+            return False
         return True
+
+    def collect(self, label: str) -> list[findings.Finding]:
+        return list(self.reported.get(label, []))
 
 
 class BaselineCommandTest(unittest.TestCase):
@@ -1152,6 +1168,41 @@ class BaselineCheckTest(unittest.TestCase):
     def test_a_missing_baseline_is_an_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "run devloop baseline first"):
             self._run("[]")
+
+
+class BaselineCollectionTest(unittest.TestCase):
+    """A failing finding step must not stop the collection or drop its entries."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+        self.path = self.root / "devloop-baseline.json"
+        spec = CheckSpec("custom", ("{python}", "custom.py"), "none")
+        self.cfg = fake_config(self.root, baseline=self.path, checks=(spec,))
+
+    def _write(self) -> dict[str, set[str]]:
+        ScriptedSteps.ruff_output = "[]"
+        ScriptedSteps.reported = {
+            "quality": [findings.Finding("quality", "pkg/module.py:long", "long function")],
+            "custom": [findings.Finding("custom", "pkg/module.py::main:annotation", "missing")],
+        }
+        ScriptedSteps.failing = {"quality"}
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.Steps", ScriptedSteps),
+            redirect_stdout(StringIO()),
+        ):
+            code = cli.run_baseline(fake_args())
+        self.assertEqual(code, 0)
+        return baseline.load(self.path)
+
+    def test_the_step_after_a_failing_one_still_runs(self) -> None:
+        entries = self._write()
+        self.assertEqual(entries["quality"], {"pkg/module.py:long"})
+        self.assertEqual(entries["custom"], {"pkg/module.py::main:annotation"})
 
 
 class FindingsOutputTest(unittest.TestCase):

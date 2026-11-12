@@ -195,11 +195,14 @@ paths = "none"          # none | changed | all
 ```
 
 `paths` decides the arguments: `none` appends nothing (like `policy`), `changed`
-appends the changed Python files, `all` appends every source and test file. A
-nonzero exit fails the step and the pipeline. With a baseline in play the step
-also receives `DEVLOOP_FINDINGS_FILE`, and its keys land under `name` in the
-baseline file. Names must be unique; the order of the tables is the order the
-checks run in.
+appends the changed Python files, `all` appends every source and test file.
+`changed` is **not** widened by `--full`: it still receives only the changed
+files, and on a clean tree the step is skipped with a line saying so. A check
+that must cover the whole tree in the commit gate uses `all`; `changed` is for
+the edit loop. A nonzero exit fails the step and the pipeline. With a baseline in
+play the step also receives `DEVLOOP_FINDINGS_FILE`, and its keys land under
+`name` in the baseline file. Names must be unique; the order of the tables is
+the order the checks run in.
 
 ## Baseline
 

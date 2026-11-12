@@ -22,6 +22,7 @@ from pathlib import Path
 
 MYPY_TAIL = re.compile(r"^(?P<body>.*?)\s+\[(?P<code>[A-Za-z0-9_-]+)\]$")
 MYPY_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+): error: (?P<message>.*)$")
+FORMAT_LINE = re.compile(r"^Would reformat: (?P<path>.+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,20 @@ def parse_ruff(output: str, root: Path, step: str = "ruff") -> list[Finding]:
         row = location.get("row", 0) if isinstance(location, dict) else 0
         message = str(item.get("message", "")).strip()
         found.append(Finding(step, f"{path}:{code}", f"{path}:{row}: {code} {message}"))
+    return found
+
+
+def parse_ruff_format(output: str, root: Path, step: str = "format") -> list[Finding]:
+    """``ruff format --check`` as findings keyed by path.
+
+    The formatter has no error codes, so the key is ``<path>:format``: a file is
+    either reformatted by the tool or not, and that is the unit a baseline can
+    freeze without hiding a second unformatted file.
+    """
+    found: list[Finding] = []
+    for match in FORMAT_LINE.finditer(output):
+        path = _relative(root, match.group("path"))
+        found.append(Finding(step, f"{path}:format", f"{path}: would be reformatted"))
     return found
 
 

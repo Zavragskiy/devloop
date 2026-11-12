@@ -65,6 +65,8 @@ def fake_args(**overrides) -> argparse.Namespace:
         "no_cache": False,
         "keep_going": False,
         "explain": False,
+        "changed_only": False,
+        "check": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -439,8 +441,10 @@ class RecordingSteps:
         self.outputs = dict(outputs or {})
         self.reported = dict(reported or {})
         self.verdicts: dict[str, bool] = {}
+        self.ran: set[str] = set()
 
     def run(self, label: str, command: list[str] | None) -> bool:
+        self.ran.add(label)
         self.commands.append((label, command or []))
         return True
 
@@ -936,10 +940,10 @@ class ScriptedSteps(cli.Steps):
 
     def __init__(self, cfg: config.Config, keep_going: bool, quiet: frozenset[str] = frozenset()):
         super().__init__(cfg, keep_going, quiet)
-        self.ran: list[str] = []
+        self.ran = set()
 
     def run(self, label: str, command: list[str] | None) -> bool:
-        self.ran.append(label)
+        self.ran.add(label)
         self.outputs[label] = self.ruff_output if label == "ruff" else ""
         return True
 
@@ -1027,6 +1031,145 @@ class RunnerExampleTest(unittest.TestCase):
             (self.root / ".devloop" / "run-tests.json").read_text(encoding="utf-8")
         )
         self.assertEqual([shard["name"] for shard in summary["shards"]], ["last-failed"])
+
+
+class MypyConfigWireTest(unittest.TestCase):
+    """``mypy.changed_only`` reaches the pipeline; ``--full`` keeps the whole scope."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+        self.cfg = fake_config(self.root, mypy_scope=("pkg",), mypy_changed_only=True)
+
+    def _steps(self, args: argparse.Namespace) -> RecordingSteps:
+        steps = RecordingSteps()
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch(
+                "devloop.cli.gitinfo.collect",
+                return_value=[Change("pkg/module.py", " M")],
+            ),
+            patch("devloop.cli.Steps", return_value=steps),
+            patch("devloop.cli._test_step"),
+            patch("devloop.cli.verdict.tree_key", return_value="key"),
+            patch("devloop.cli.verdict.recent", return_value=False),
+            redirect_stdout(StringIO()),
+        ):
+            cli.run_check(args)
+        return steps
+
+    def test_the_configuration_key_is_honoured_in_changed_mode(self) -> None:
+        steps = self._steps(fake_args())
+        self.assertEqual(dict(steps.commands)["mypy"][-1], "pkg/module.py")
+
+    def test_a_full_run_ignores_it_and_checks_the_scope(self) -> None:
+        steps = self._steps(fake_args(full=True))
+        self.assertEqual(dict(steps.commands)["mypy"][-1], "pkg")
+
+
+class StaleFindingsTest(unittest.TestCase):
+    """A step that did not run must not read the previous run's findings file."""
+
+    def test_collect_is_empty_for_a_step_that_never_ran(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg = fake_config(root)
+            report_file = cfg.cache_dir / "findings" / "quality.jsonl"
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text('{"key": "old@pkg/x.py"}\n', encoding="utf-8")
+            steps = cli.Steps(cfg, keep_going=False)
+            steps.failures.append("ruff")
+            steps.run("quality", [sys.executable, "-c", "print('never')"])
+            self.assertEqual(steps.collect("quality"), [])
+            self.assertNotIn("quality", steps.outputs)
+
+
+class FormatBaselineTest(unittest.TestCase):
+    """The formatter is a finding step: ``<path>:format`` freezes into the baseline."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+
+    def _steps(self, entries: dict[str, set[str]]) -> RecordingSteps:
+        output = "Would reformat: pkg/module.py\n1 file would be reformatted\n"
+        steps = RecordingSteps(outputs={"format": output})
+        cli._static_steps(
+            fake_config(self.root), steps, ["pkg/module.py"], full=False, entries=entries
+        )
+        return steps
+
+    def test_a_frozen_unformatted_file_passes(self) -> None:
+        steps = self._steps({"format": {"pkg/module.py:format"}})
+        self.assertTrue(steps.verdicts["format"])
+
+    def test_an_unformatted_file_outside_the_baseline_fails(self) -> None:
+        steps = self._steps({"format": set()})
+        self.assertFalse(steps.verdicts["format"])
+        self.assertIn("format", steps.failures)
+
+
+class BaselineCheckTest(unittest.TestCase):
+    """``baseline --check`` fails on a new finding and on a stale entry."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        self.path = self.root / "devloop-baseline.json"
+        self.cfg = fake_config(self.root, baseline=self.path)
+
+    def _run(self, output: str) -> int:
+        ScriptedSteps.ruff_output = output
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.Steps", ScriptedSteps),
+            redirect_stdout(StringIO()),
+        ):
+            return cli.run_baseline(fake_args(check=True))
+
+    def test_a_current_baseline_passes(self) -> None:
+        baseline.save(self.path, {})
+        self.assertEqual(self._run("[]"), 0)
+
+    def test_a_new_finding_fails(self) -> None:
+        baseline.save(self.path, {})
+        output = json.dumps([{"code": "E501", "filename": "pkg/module.py"}])
+        self.assertEqual(self._run(output), 1)
+
+    def test_a_stale_entry_fails(self) -> None:
+        baseline.save(self.path, {"ruff": {"gone.py:F401"}})
+        self.assertEqual(self._run("[]"), 1)
+
+    def test_a_missing_baseline_is_an_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "run devloop baseline first"):
+            self._run("[]")
+
+
+class FindingsOutputTest(unittest.TestCase):
+    """A project's own finding prints its key; the built-in tools keep the body."""
+
+    def _print(self, detail: bool) -> str:
+        buffer = StringIO()
+        finding = findings.Finding("quality", "dupe@pkg/x.py", "two main() definitions")
+        with redirect_stdout(buffer):
+            report.new_findings("quality", [finding], 0, detail=detail)
+        return buffer.getvalue()
+
+    def test_the_default_is_the_key_only(self) -> None:
+        output = self._print(detail=False)
+        self.assertIn("dupe@pkg/x.py", output)
+        self.assertNotIn("two main", output)
+
+    def test_detail_adds_the_message(self) -> None:
+        self.assertIn("two main", self._print(detail=True))
 
 
 if __name__ == "__main__":

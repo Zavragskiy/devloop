@@ -68,6 +68,7 @@ class Steps:
         self.failures: list[str] = []
         self.seconds: float = 0.0
         self.outputs: dict[str, str] = {}
+        self.ran: set[str] = set()
 
     @property
     def stopped(self) -> bool:
@@ -87,6 +88,7 @@ class Steps:
         """Run one step; True when it passed or was skipped."""
         if command is None or self.stopped:
             return True
+        self.ran.add(label)
         print(f"[verify] {label} ...")
         started = time.monotonic()
         path = self.report_path(label)
@@ -114,7 +116,9 @@ class Steps:
         return result.returncode == 0
 
     def collect(self, label: str) -> list[findings.Finding]:
-        """The findings a step wrote for this run."""
+        """The findings a step wrote for this run, never a previous run's file."""
+        if label not in self.ran:
+            return []
         return findings.read_report(self.report_path(label), label)
 
     def settle(self, label: str, ok: bool) -> None:
@@ -140,17 +144,21 @@ def _settle(
     found: list[findings.Finding],
     entries: dict[str, set[str]],
     full: bool,
+    *,
+    detail: bool = False,
 ) -> None:
     """Decide one step by what a baseline already accepts."""
+    if label not in steps.ran:
+        return
     comparison = baseline.compare(entries, {label: found}, [label], full=full)
     fresh = list(comparison.new.get(label, ()))
     known_keys = entries.get(label, set())
     known = sum(1 for finding in found if finding.key in known_keys)
     if fresh:
-        report.new_findings(label, fresh, known)
+        report.new_findings(label, fresh, known, detail=detail)
         steps.settle(label, ok=False)
     elif found:
-        report.new_findings(label, [], known)
+        report.new_findings(label, [], known, detail=detail)
         steps.settle(label, ok=True)
     elif label in steps.failures:
         output = steps.failure_output(label)
@@ -184,8 +192,11 @@ def _static_steps(
                 ),
             )
             found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
-            _settle(steps, "ruff", found, entries, full)
+            _settle(steps, "ruff", found, entries, full, detail=True)
         steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *gated))
+        if entries is not None:
+            found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
+            _settle(steps, "format", found, entries, full)
     if cfg.quality is not None and gated:
         steps.run("quality", _python(cfg, str(cfg.quality), *gated))
         if entries is not None:
@@ -193,15 +204,18 @@ def _static_steps(
     if cfg.policy is not None:
         steps.run("policy", _python(cfg, str(cfg.policy)))
     if full or any(_is_source(cfg, path) for path in files):
+        if changed_only and full:
+            print("[verify] mypy: changed-only is ignored on --full, the whole scope is checked")
+            changed_only = False
         frozen = entries is not None
         command = _mypy_command(cfg, files, changed_only=changed_only, baseline_mode=frozen)
         if command is None:
-            print("[verify] mypy: skipped (no changed files in scope)")
+            print("[verify] mypy: skipped, no changed file inside the mypy scope")
         else:
             steps.run("mypy", command)
             if entries is not None:
                 found = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
-                _settle(steps, "mypy", found, entries, full)
+                _settle(steps, "mypy", found, entries, full, detail=True)
     for spec in cfg.checks:
         _run_check(cfg, steps, spec, files, entries, full)
 
@@ -380,7 +394,7 @@ def run_check(args: argparse.Namespace) -> int:
         print("[verify] this tree already passed the full gate; nothing to re-check")
         return 0
     entries = _baseline_entries(cfg)
-    quiet = frozenset({"ruff", "mypy"}) if entries is not None else frozenset()
+    quiet = frozenset({"ruff", "format", "mypy"}) if entries is not None else frozenset()
     steps = Steps(cfg, args.keep_going, quiet=quiet)
     _static_steps(
         cfg,
@@ -388,7 +402,7 @@ def run_check(args: argparse.Namespace) -> int:
         files,
         args.full,
         entries=entries,
-        changed_only=args.changed_only,
+        changed_only=args.changed_only or cfg.mypy_changed_only,
     )
     _test_step(cfg, steps, changes, args)
     code = _finish(steps)
@@ -409,16 +423,11 @@ def _changed_python(cfg: Config, changes: list[gitinfo.Change]) -> list[str]:
     ]
 
 
-def run_baseline(args: argparse.Namespace) -> int:
-    """Freeze the findings the whole tree has today into the baseline file."""
-    cfg = config.load()
-    if cfg.baseline is None:
-        raise ValueError('the baseline is disabled by [tool.devloop] baseline = ""')
+def _collect_findings(cfg: Config, steps: Steps) -> dict[str, list[findings.Finding]] | None:
+    """Run every finding step over the whole tree, or ``None`` when one broke."""
     targets = _all_python(cfg)
-    steps = Steps(cfg, keep_going=False, quiet=frozenset({"ruff", "mypy"}))
     observed: dict[str, list[findings.Finding]] = {}
     broken: list[str] = []
-
     if targets:
         steps.run(
             "ruff",
@@ -428,9 +437,13 @@ def run_baseline(args: argparse.Namespace) -> int:
             observed["ruff"] = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
         except ValueError as error:
             print(f"devloop: {error}", file=sys.stderr)
-            return 2
+            return None
         if "ruff" in steps.failures:
             broken.append("ruff")
+        steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *targets))
+        observed["format"] = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
+        if "format" in steps.failures and not observed["format"]:
+            broken.append("format")
         command = _mypy_command(cfg, targets, changed_only=False, baseline_mode=True)
         if command is not None:
             steps.run("mypy", command)
@@ -448,8 +461,48 @@ def run_baseline(args: argparse.Namespace) -> int:
         if spec.name in steps.failures and not observed[spec.name]:
             broken.append(spec.name)
     if broken:
-        print(f"devloop: the baseline was not written: {', '.join(broken)} failed", file=sys.stderr)
+        print(f"devloop: {', '.join(broken)} failed without a finding", file=sys.stderr)
+        return None
+    return observed
+
+
+def _check_baseline(cfg: Config, observed: dict[str, list[findings.Finding]]) -> int:
+    """Compare the tree with the baseline without writing; 1 when it drifted."""
+    assert cfg.baseline is not None
+    if not cfg.baseline.is_file():
+        raise ValueError(f"no baseline at {cfg.baseline}; run devloop baseline first")
+    entries = baseline.load(cfg.baseline)
+    comparison = baseline.compare(entries, observed, [*observed, *entries], full=True)
+    dirty = False
+    for step in sorted({*observed, *entries}):
+        found = observed.get(step, [])
+        known = sum(1 for finding in found if finding.key in entries.get(step, set()))
+        fresh = list(comparison.new.get(step, ()))
+        stale = list(comparison.stale.get(step, ()))
+        if fresh:
+            report.new_findings(step, fresh, known, detail=step in {"ruff", "format", "mypy"})
+            dirty = True
+        if stale:
+            report.stale_entries(step, stale)
+            dirty = True
+    if dirty:
+        return 1
+    print(f"[verify] baseline is current ({sum(len(keys) for keys in entries.values())} entries)")
+    return 0
+
+
+def run_baseline(args: argparse.Namespace) -> int:
+    """Freeze the findings the whole tree has today into the baseline file."""
+    cfg = config.load()
+    if cfg.baseline is None:
+        raise ValueError('the baseline is disabled by [tool.devloop] baseline = ""')
+    quiet = frozenset({"ruff", "format", "mypy"})
+    steps = Steps(cfg, keep_going=False, quiet=quiet)
+    observed = _collect_findings(cfg, steps)
+    if observed is None:
         return 2
+    if getattr(args, "check", False):
+        return _check_baseline(cfg, observed)
     baseline.save(
         cfg.baseline, {step: [found.key for found in items] for step, items in observed.items()}
     )
@@ -494,7 +547,9 @@ tree it gated, so repeating it on an unchanged tree answers in about a second;
 
 A baseline file (devloop-baseline.json unless configured otherwise) freezes the
 findings a tree already has: check fails only on new ones, and --full names the
-entries that no longer match. devloop baseline rewrites it from the whole tree.
+entries that no longer match. devloop baseline rewrites it from the whole tree;
+devloop baseline --check fails when a new finding or a stale entry appears, so
+CI can keep the accepted debt from rotting.
 """
 
 DESCRIPTION = """\
@@ -531,7 +586,14 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
     parser.add_argument(
         "--changed-only",
         action="store_true",
-        help="mypy checks the changed files (inside the configured scope) even on --full",
+        help="mypy checks the changed files inside the configured scope (changed mode; "
+        "ignored on --full)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="baseline command: compare the tree with the baseline and fail on a new or "
+        "stale entry, without writing",
     )
     parser.add_argument(
         "--files",

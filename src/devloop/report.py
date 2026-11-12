@@ -62,10 +62,14 @@ def _log_tail(cfg: Config, log: str) -> None:
         print(f"  {line}")
 
 
-def new_findings(step: str, fresh: list[Finding], known: int) -> None:
-    """Print the findings a baseline does not cover and the step's verdict."""
+def new_findings(step: str, fresh: list[Finding], known: int, *, detail: bool = False) -> None:
+    """Print the findings a baseline does not cover and the step's verdict.
+
+    A project's own command prints its findings itself, so only the key is
+    repeated here; the built-in tools keep their message, which carries the line.
+    """
     for finding in fresh[:FINDINGS_TAIL]:
-        print(f"  {finding.message}")
+        print(f"  {finding.message}  ({finding.key})" if detail else f"  {finding.key}")
     if len(fresh) > FINDINGS_TAIL:
         print(f"  ... and {len(fresh) - FINDINGS_TAIL} more")
     if fresh:

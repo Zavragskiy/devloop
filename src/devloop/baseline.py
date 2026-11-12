@@ -18,6 +18,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from devloop import __version__
 from devloop.findings import Finding
 
 VERSION = 1
@@ -61,6 +62,7 @@ def save(path: Path, entries: Mapping[str, Iterable[str]]) -> None:
     """Write the baseline atomically, sorted, and drop the empty steps."""
     payload = {
         "version": VERSION,
+        "generated_by": f"devloop {__version__}",
         "entries": {step: sorted(set(keys)) for step, keys in sorted(entries.items()) if set(keys)},
     }
     path.parent.mkdir(parents=True, exist_ok=True)

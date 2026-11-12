@@ -259,7 +259,9 @@ class ConfigTest(unittest.TestCase):
             )
             child = root / "tests" / "nested"
             child.mkdir(parents=True)
-            self.assertEqual(config.find_root(child), root)
+            # find_root resolves its candidate: a Windows temp path may be a short
+            # 8.3 name, and the resolved form is the one the config must carry.
+            self.assertEqual(config.find_root(child), root.resolve())
             cfg = config.load(root)
             self.assertEqual(cfg.source_roots, ("src/pkg",))
             self.assertIsNone(cfg.runner)

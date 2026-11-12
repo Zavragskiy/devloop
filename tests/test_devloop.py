@@ -23,6 +23,7 @@ from devloop import (  # noqa: E402
     gitinfo,
     graph,
     impact,
+    process,
     report,
     selector,
     verdict,
@@ -1170,6 +1171,31 @@ class FindingsOutputTest(unittest.TestCase):
 
     def test_detail_adds_the_message(self) -> None:
         self.assertIn("two main", self._print(detail=True))
+
+
+class ProcessDecodingTest(unittest.TestCase):
+    """A child that prints UTF-8 must not lose its output on a legacy code page."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+
+    def test_utf8_output_survives_a_legacy_code_page(self) -> None:
+        steps = cli.Steps(fake_config(self.root), keep_going=False)
+        script = "import sys; sys.stdout.buffer.write('Иван, Пётр и Ёж'.encode('utf-8'))"
+        self.assertTrue(steps.run("probe", [sys.executable, "-c", script]))
+        self.assertIn("Иван", steps.outputs["probe"])
+        self.assertIn("Ёж", steps.outputs["probe"])
+
+    def test_the_locale_code_page_is_the_second_choice(self) -> None:
+        with patch("devloop.process.locale.getpreferredencoding", return_value="cp1251"):
+            self.assertEqual(process.decode("Привет".encode("cp1251")), "Привет")
+
+    def test_undecodable_bytes_do_not_raise(self) -> None:
+        with patch("devloop.process.locale.getpreferredencoding", return_value="cp1251"):
+            text = process.decode(b"\xff\xfe\x98")
+        self.assertIsInstance(text, str)
 
 
 if __name__ == "__main__":

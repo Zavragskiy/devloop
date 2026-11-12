@@ -7,9 +7,10 @@ synthetic deletion for the old path, so test impact cannot miss moved modules.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from devloop import process
 
 
 @dataclass(frozen=True)
@@ -28,9 +29,9 @@ class Change:
         return self.status == "??"
 
 
-def _run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(root: Path, *args: str) -> process.Result:
     """Run one git command in ``root`` without raising on a non-zero exit."""
-    return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False)
+    return process.run(["git", *args], cwd=root)
 
 
 def output(root: Path, *args: str) -> str:

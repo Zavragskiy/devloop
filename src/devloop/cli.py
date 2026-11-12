@@ -13,13 +13,22 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from devloop import baseline, config, findings, gitinfo, impact, report, selector, verdict
+from devloop import (
+    baseline,
+    config,
+    findings,
+    gitinfo,
+    impact,
+    process,
+    report,
+    selector,
+    verdict,
+)
 from devloop.config import CheckSpec, Config
 
 
@@ -97,16 +106,10 @@ class Steps:
             path.unlink()
         except FileNotFoundError:
             pass
-        result = subprocess.run(
-            command,
-            cwd=self.cfg.root,
-            text=True,
-            capture_output=True,
-            env=self._environment(label),
-        )
+        result = process.run(command, cwd=self.cfg.root, env=self._environment(label))
         elapsed = time.monotonic() - started
         self.seconds += elapsed
-        output = (result.stdout or "") + (result.stderr or "")
+        output = result.stdout + result.stderr
         self.outputs[label] = output
         if output and label not in self.quiet:
             print(output, end="" if output.endswith("\n") else "\n")

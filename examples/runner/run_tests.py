@@ -24,12 +24,11 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from devloop import config
+from devloop import config, process
 
 FAILED_LINE = re.compile(r"^FAILED (\S+)", re.MULTILINE)
 
@@ -90,8 +89,8 @@ def run_shard(cfg: config.Config, name: str, targets: list[str]) -> dict[str, ob
     command = [sys.executable, "-m", "pytest", "-q", *targets]
     env = dict(os.environ)
     env.update(cfg.environment)
-    result = subprocess.run(command, cwd=cfg.root, text=True, capture_output=True, env=env)
-    output = (result.stdout or "") + (result.stderr or "")
+    result = process.run(command, cwd=cfg.root, env=env)
+    output = result.stdout + result.stderr
     log = f"shard-{slug(name)}.log"
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     (cfg.cache_dir / log).write_text(output, encoding="utf-8")

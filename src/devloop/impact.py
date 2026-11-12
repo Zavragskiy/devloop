@@ -8,10 +8,10 @@ when the selector fails, returns nothing, or selects most of the suite.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from devloop import process
 from devloop.config import Config
 from devloop.gitinfo import Change
 
@@ -177,7 +177,7 @@ def _relevant(cfg: Config, changes: list[Change]) -> bool:
 
 def _run_selector(cfg: Config, every: list[str], command: list[str]) -> Selection:
     try:
-        result = subprocess.run(command, cwd=cfg.root, text=True, capture_output=True, check=False)
+        result = process.run(command, cwd=cfg.root)
     except OSError as error:
         return _fail_open(cfg, f"selector could not start: {error}")
     if result.returncode != 0:

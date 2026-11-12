@@ -1,11 +1,26 @@
 [project]
 name = "devloop"
-version = "0.1.0"
-description = "Fast, configurable verification loop for Python projects"
-authors = [{ name = "Devloop contributors" }]
+version = "0.2.0"
+description = "Fast verification loop for Python projects: changed-file gates plus the tests a change affects"
+authors = [{ name = "Zavragskiy" }]
+license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
+keywords = ["testing", "developer-tools", "ci", "lint", "impact-analysis", "test-selection"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Zavragskiy/devloop"
+Repository = "https://github.com/Zavragskiy/devloop"
+Documentation = "https://github.com/Zavragskiy/devloop/blob/main/docs/integration.md"
 
 [project.scripts]
 devloop = "devloop.cli:main"
@@ -16,11 +31,24 @@ packages = [{ include = "devloop", from = "src" }]
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0"
 ruff = "^0.15"
+mypy = "^1.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
 
 [build-system]
 requires = ["poetry-core>=2.0"]
 build-backend = "poetry.core.masonry.api"
-

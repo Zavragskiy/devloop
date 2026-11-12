@@ -1,0 +1,7 @@
+# Keep every checkout on LF so a Windows clone cannot rewrite line endings and
+# invalidate content hashes (the import-graph cache and the verdict key).
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf

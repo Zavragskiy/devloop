@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 def digest(data: bytes) -> str:
@@ -43,19 +44,19 @@ class Cache:
 
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict = self._load()
+        self.data: dict[str, Any] = self._load()
 
-    def _load(self) -> dict:
+    def _load(self) -> dict[str, Any]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def get(self, key: str, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
 
-    def put(self, key: str, value) -> None:
+    def put(self, key: str, value: Any) -> None:
         self.data[key] = value
 
     def save(self) -> None:

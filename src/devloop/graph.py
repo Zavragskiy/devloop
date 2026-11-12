@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from devloop import cache as caching
 from devloop.config import Config
@@ -217,7 +218,7 @@ def _rebuild_reverse(graph: ImportGraph) -> None:
             graph.reverse.setdefault(target, set()).add(node)
 
 
-def _fingerprint(cfg: Config, layout: Layout) -> dict:
+def _fingerprint(cfg: Config, layout: Layout) -> dict[str, Any]:
     inputs = _python_files(layout.source_roots) + _python_files([layout.tests_root])
     return {
         "version": GRAPH_VERSION,

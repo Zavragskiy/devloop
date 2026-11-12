@@ -28,8 +28,22 @@ class Change:
         return self.status == "??"
 
 
+def _run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run one git command in ``root`` without raising on a non-zero exit."""
+    return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False)
+
+
+def output(root: Path, *args: str) -> str:
+    """Output of a read-only git query, empty when the command fails.
+
+    The verdict key is only a cache: a repo without history, a detached state
+    or a missing git executable must degrade to a cache miss, never raise.
+    """
+    return _run(root, *args).stdout
+
+
 def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False)
+    result = _run(root, *args)
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit {result.returncode}"
         raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
@@ -38,8 +52,8 @@ def _git(root: Path, *args: str) -> str:
 
 def working_tree(root: Path) -> list[Change]:
     """Every staged, unstaged and untracked path relative to ``root``."""
-    output = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-    fields = output.split("\0")
+    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    fields = status.split("\0")
     changes: list[Change] = []
     index = 0
     while index < len(fields):
@@ -47,21 +61,21 @@ def working_tree(root: Path) -> list[Change]:
         index += 1
         if not entry:
             continue
-        status = entry[:2]
+        change_status = entry[:2]
         path = entry[3:]
-        if status[0] in "RC" or status[1] in "RC":
+        if change_status[0] in "RC" or change_status[1] in "RC":
             old_path = fields[index]
             index += 1
-            if "R" in status and old_path != path:
+            if "R" in change_status and old_path != path:
                 changes.append(Change(path=old_path, status=" D"))
-        changes.append(Change(path=path, status=status))
+        changes.append(Change(path=path, status=change_status))
     return changes
 
 
 def since(root: Path, base: str) -> list[Change]:
     """Committed, staged and unstaged changes against ``base``, plus untracked."""
-    output = _git(root, "diff", "--name-status", "--no-renames", "-z", f"{base}...HEAD")
-    fields = output.split("\0")
+    listed = _git(root, "diff", "--name-status", "--no-renames", "-z", f"{base}...HEAD")
+    fields = listed.split("\0")
     changes: dict[str, Change] = {}
     for status, path in zip(fields[::2], fields[1::2]):
         if path:

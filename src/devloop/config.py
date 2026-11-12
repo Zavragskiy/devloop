@@ -1,4 +1,24 @@
-"""Read project settings from ``[tool.devloop]`` in ``pyproject.toml``."""
+"""Project settings read from ``[tool.devloop]`` in ``pyproject.toml``.
+
+Everything project-specific lives in that one table, so this package works in
+any repository unchanged. The selector, the quality gate, the policy gate and
+the test runner are commands: a project plugs in its own implementations and
+this package stays free of project knowledge.
+
+.. code-block:: toml
+
+    [tool.devloop]
+    source_roots = ["src/my_package"]
+    tests_root = "tests"
+    cache_dir = ".devloop"
+    runner = "tools/run_tests.py"
+    quality = "tools/check_quality.py"
+    policy = "tools/check_package_policy.py"
+    selector = ["{python}", "-m", "devloop", "select-tests"]
+    shared = ["pyproject.toml", "poetry.lock"]
+    always = ["tests/test_contract.py"]
+    max_fraction = 0.6
+"""
 
 from __future__ import annotations
 
@@ -7,12 +27,14 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-DEFAULTS = {
+DEFAULTS: dict[str, Any] = {
     "tests_root": "tests",
     "cache_dir": ".devloop",
     "runner": "",
     "quality": "",
+    "policy": "",
     "selector": ["{python}", "-m", "devloop", "select-tests"],
     "shared": ["pyproject.toml"],
     "always": [],
@@ -35,6 +57,7 @@ class Config:
     shared: tuple[str, ...]
     always: tuple[str, ...]
     max_fraction: float
+    policy: Path | None = None
 
     def relative(self, path: Path) -> str:
         """Return a repository-relative POSIX path."""
@@ -58,24 +81,29 @@ class Config:
         return shutil.which(name) or name
 
 
-def _table(root: Path) -> dict:
-    with (root / "pyproject.toml").open("rb") as handle:
-        data = tomllib.load(handle)
-    return data.get("tool", {}).get("devloop", {})
+def _table(root: Path) -> dict[str, Any]:
+    """The ``[tool.devloop]`` table of one project, or an empty dict."""
+    path = root / "pyproject.toml"
+    if not path.is_file():
+        return {}
+    with path.open("rb") as handle:
+        data: dict[str, Any] = tomllib.load(handle)
+    tool = data.get("tool", {})
+    table = tool.get("devloop", {}) if isinstance(tool, dict) else {}
+    return table if isinstance(table, dict) else {}
 
 
 def find_root(start: Path | None = None) -> Path:
     """Find the configured project from the working directory or a child."""
-    start = (start or Path.cwd()).resolve()
-    for candidate in (start, *start.parents):
-        pyproject = candidate / "pyproject.toml"
-        if pyproject.is_file() and _table(candidate):
+    current = (start or Path.cwd()).resolve()
+    for candidate in (current, *current.parents):
+        if _table(candidate):
             return candidate
     raise ValueError("no [tool.devloop] table found above the current directory")
 
 
 def load(root: Path | None = None) -> Config:
-    """Resolve settings for the configured project."""
+    """Resolve the settings of the project at ``root`` (or the nearest one)."""
     root = (root or find_root()).resolve()
     table = _table(root)
     if not table:
@@ -99,4 +127,5 @@ def load(root: Path | None = None) -> Config:
         shared=tuple(settings["shared"]),
         always=tuple(settings["always"]),
         max_fraction=fraction,
+        policy=root / str(settings["policy"]) if settings["policy"] else None,
     )

@@ -105,7 +105,14 @@ per finding:
 Only `key` is required. A script that ignores the variable keeps working exactly
 as before; its findings are simply not covered by the baseline. When the
 variable is set and the script exits nonzero, emitting no key at all is treated
-as a broken script, not as a clean run. See [Baseline](#baseline).
+as a broken script, not as a clean run. The run prints the keys only, since the
+script already printed its own detail; the built-in tools keep their message
+because their output is captured. See [Baseline](#baseline).
+
+A warning for adapters built on `lizard`: `lizard -w --csv` prints human
+`warning:` lines instead of CSV in some versions, so a parser can silently see
+zero findings and leave the gate half-blind. Check the output shape before
+trusting it.
 
 ### Policy gate
 
@@ -204,8 +211,10 @@ are not finding steps) and writes `devloop-baseline.json`:
 ```json
 {
   "version": 1,
+  "generated_by": "devloop 0.3.1",
   "entries": {
     "ruff": ["build_modules/x.py:E501", "build_modules/x.py:F401"],
+    "format": ["build_modules/legacy_view.py:format"],
     "mypy": ["shared_utils/y.py:attr-defined"],
     "quality": ["duplicate-main@build_modules/z.py"]
   }
@@ -219,6 +228,15 @@ it, and prints the key and the tool's own message. Ruff is run as
 ratchet is per file and per code, the way an inline `# noqa` is. The same key
 twice in one file is one entry.
 
+The formatter is a finding step too: `ruff format --check` prints
+`Would reformat: <path>` and the key is `<path>:format`, so a tree full of
+unformatted legacy files can be gated without reformatting it in one commit.
+
+Keys written by a project command are free-form, but keep them readable across
+repositories: the built-in tools already use `:` between the path and the code,
+so `<path>::<symbol>:<rule>` (for example
+`pkg/x.py::build_panel:complexity`) avoids an ambiguous key.
+
 The semantics that matter:
 
 - a key in the baseline passes, whatever its count;
@@ -226,6 +244,9 @@ The semantics that matter:
 - entries that are no longer reported are **stale**; that is printed only on
   `--full` (a changed-file run sees a subset of the tree, so it must not call the
   rest stale) and never fails the run; `devloop baseline` rewrites the file;
+- `devloop baseline --check` runs the same collection without writing and exits
+  `1` when anything is new or stale, so CI can keep the accepted debt from
+  rotting: every fix has to delete its entry;
 - no baseline file means the mechanism is off; a corrupt or wrong-version file is
   an error, never a silently empty baseline;
 - `baseline = ""` disables the mechanism even when a file exists.
@@ -285,10 +306,12 @@ scope = ["shared_utils", "support_modules", "build_modules"]
 changed_only = true
 ```
 
-With `changed_only` the changed mode passes the changed files inside the scope
-instead of the whole scope; `devloop check --changed-only` forces that even on
-`--full`. Fields listed here are validated at load time: a scope entry must
-exist inside the project.
+With `changed_only`, or the `--changed-only` flag, the changed mode passes the
+changed files inside the scope instead of the whole scope. On `--full` the whole
+scope is always checked, because a full run is the final gate and a clean tree
+with `changed_only` would otherwise be a green run that checked nothing. The
+flag is ignored there with a line saying so. Fields listed here are validated at
+load time: a scope entry must exist inside the project.
 
 `devloop.cache` (`Cache`, `digest`, `hash_file`) is documented public API, so a
 project gate can reuse the same content-hash cache instead of inventing one.

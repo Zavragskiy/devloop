@@ -65,7 +65,8 @@ Three decisions follow from that:
 
 * keys are `<path>:<code>`, not `<code>`. A code-wide baseline would accept the
   next file that repeats the mistake; a file-wide one is the unit a reviewer can
-  reason about.
+  reason about. The formatter has no codes, so its key is `<path>:format`: a file
+  is either reformatted by the tool or not.
 * keys are matched as a set, not counted. A second occurrence of an accepted
   finding in the same file is not the ratchet's job; the count would need a
   re-baseline after every unrelated edit and would make the file noisy.

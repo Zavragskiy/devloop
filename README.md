@@ -84,6 +84,7 @@ From the consuming project's root, in its own environment:
 | `devloop check --base origin/main` | a branch diff instead of the working tree |
 | `devloop check --changed-only` | mypy over the changed files inside its scope |
 | `devloop baseline` | freeze the findings the tree has today |
+| `devloop baseline --check` | fail when the baseline has a new or a stale entry |
 | `devloop impact` | print the affected test files, run nothing |
 | `devloop changed` | list the git entries the selection sees |
 | `devloop select-tests` | the built-in selector: one affected test path per line |
@@ -134,8 +135,10 @@ Any edit, stage or revert changes the key, ignored paths do not, and
 tree and writes `devloop-baseline.json`. After that `check` fails only on a
 finding the file does not list, and `--full` prints the entries that no longer
 match anything — a warning, never a failure. Ruff and mypy keys are
-`<path>:<code>`, so the ratchet is per file and per code; a quality script opts
-in by appending its own keys to `$DEVLOOP_FINDINGS_FILE`.
+`<path>:<code>`, the formatter's is `<path>:format`, so the ratchet is per file
+and per rule; a quality script opts in by appending its own keys to
+`$DEVLOOP_FINDINGS_FILE`. `devloop baseline --check` fails on anything new or
+stale, so CI can keep the accepted debt from rotting.
 
 ### The steps get what the project needs
 

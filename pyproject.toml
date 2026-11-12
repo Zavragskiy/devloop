@@ -1,6 +1,6 @@
 [project]
 name = "devloop"
-version = "0.3.3"
+version = "0.3.4"
 description = "Fast verification loop for Python projects: changed-file gates plus the tests a change affects"
 authors = [{ name = "Zavragskiy" }]
 license = "MIT"

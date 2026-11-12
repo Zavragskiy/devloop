@@ -110,12 +110,12 @@ def _changed_python(cfg: Config, changes: list[gitinfo.Change]) -> list[str]:
 
 
 def _static_steps(cfg: Config, steps: Steps, files: list[str], full: bool) -> None:
-    if files:
-        steps.run("ruff", _python(cfg, "-m", "ruff", "check", *files))
-        steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *files))
-    gate_files = _all_python(cfg) if full else files
-    if cfg.quality is not None and gate_files:
-        steps.run("quality", _python(cfg, str(cfg.quality), *gate_files))
+    gated = _all_python(cfg) if full else files
+    if gated:
+        steps.run("ruff", _python(cfg, "-m", "ruff", "check", *gated))
+        steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *gated))
+    if cfg.quality is not None and gated:
+        steps.run("quality", _python(cfg, str(cfg.quality), *gated))
     if cfg.policy is not None:
         steps.run("policy", _python(cfg, str(cfg.policy)))
     if full or any(_is_source(cfg, path) for path in files):

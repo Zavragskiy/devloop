@@ -495,6 +495,33 @@ class PolicyStepTest(unittest.TestCase):
         self.assertNotIn("quality", [label for label, _ in steps.commands])
 
 
+class FullStaticStepsTest(unittest.TestCase):
+    """``--full`` gates every Python file, not only the changed ones."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+
+    def _commands(self, files: list[str], full: bool) -> dict[str, list[str]]:
+        steps = RecordingSteps()
+        cli._static_steps(fake_config(self.root), steps, files, full=full)
+        return dict(steps.commands)
+
+    def test_full_mode_ruffs_every_python_file(self) -> None:
+        commands = self._commands([], full=True)
+        self.assertIn("pkg/module.py", commands["ruff"])
+        self.assertIn("tests/test_a.py", commands["ruff"])
+        self.assertIn("pkg/module.py", commands["format"])
+
+    def test_changed_mode_ruffs_only_the_changed_files(self) -> None:
+        commands = self._commands(["pkg/module.py"], full=False)
+        self.assertIn("pkg/module.py", commands["ruff"])
+        self.assertNotIn("tests/test_a.py", commands["ruff"])
+
+
 class VerifySelectionTest(unittest.TestCase):
     """Explicit selections bypass the selector and the full-run cache."""
 

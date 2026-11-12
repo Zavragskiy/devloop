@@ -14,6 +14,7 @@ changed files ─┐
 [tool.devloop] ┘
                  check         → the edit loop, seconds
                  check --full  → the commit / stage gate
+                 baseline      → freeze today's findings, fail only on new ones
                  impact        → which tests a change would run
 ```
 
@@ -60,6 +61,7 @@ policy = "tools/check_package_policy.py"
 shared = ["pyproject.toml", "poetry.lock"]
 always = ["tests/test_contract.py"]
 max_fraction = 0.6
+baseline = "devloop-baseline.json"
 ```
 
 Ignore the cache directory in the consuming project's `.gitignore`. Every key
@@ -80,6 +82,8 @@ From the consuming project's root, in its own environment:
 | `devloop check --only <token>` | gate the change, run only matching test files |
 | `devloop check --last-failed` | gate the change, replay the last run's failures |
 | `devloop check --base origin/main` | a branch diff instead of the working tree |
+| `devloop check --changed-only` | mypy over the changed files inside its scope |
+| `devloop baseline` | freeze the findings the tree has today |
 | `devloop impact` | print the affected test files, run nothing |
 | `devloop changed` | list the git entries the selection sees |
 | `devloop select-tests` | the built-in selector: one affected test path per line |
@@ -123,6 +127,24 @@ unstaged diff, and every untracked file's content; the next `--full` on the same
 key answers `[verify] this tree already passed the full gate` in about a second.
 Any edit, stage or revert changes the key, ignored paths do not, and
 `--no-cache` ignores the record entirely.
+
+### The debt you already have is not a blocker
+
+`devloop baseline` runs ruff, mypy and the configured quality gate over the whole
+tree and writes `devloop-baseline.json`. After that `check` fails only on a
+finding the file does not list, and `--full` prints the entries that no longer
+match anything — a warning, never a failure. Ruff and mypy keys are
+`<path>:<code>`, so the ratchet is per file and per code; a quality script opts
+in by appending its own keys to `$DEVLOOP_FINDINGS_FILE`.
+
+### The steps get what the project needs
+
+`[tool.devloop.env]` passes variables such as `QT_QPA_PLATFORM=offscreen` to every
+step subprocess, and `[[tool.devloop.check]]` runs an extra project command — an
+acceptance shard, a plan-run step — inside the same pipeline, with
+`paths = "none"`, `"changed"` or `"all"`. The mypy scope that grows package by
+package lives in `[tool.devloop.mypy]`. See
+[Integration](docs/integration.md).
 
 ## Hosting
 

@@ -53,6 +53,31 @@ A stale cache entry can only cost time. The tree key deliberately includes
 untracked file contents, so editing a new file invalidates the verdict, while
 ignored paths (`tmp/`, `.devloop/`) do not.
 
+## A baseline is a ratchet, not a switch
+
+Turning a gate off for a legacy tree and turning it on once the debt is paid is a
+trade nobody makes: the debt never gets paid. A baseline flips the default
+instead. The findings the tree has today are frozen in one committed file, and
+the gate is red only on what a change adds, which is the same shape as an inline
+`# noqa` but reviewable in one place.
+
+Three decisions follow from that:
+
+* keys are `<path>:<code>`, not `<code>`. A code-wide baseline would accept the
+  next file that repeats the mistake; a file-wide one is the unit a reviewer can
+  reason about.
+* keys are matched as a set, not counted. A second occurrence of an accepted
+  finding in the same file is not the ratchet's job; the count would need a
+  re-baseline after every unrelated edit and would make the file noisy.
+* stale entries are computed only on `--full`. A changed-file run sees a subset
+  of the tree; treating the rest as stale is the bug that makes a baseline
+  unusable from a pre-commit hook.
+
+The baseline never weakens the safety net: a missing file means the mechanism is
+off, and an unreadable one is an error, because silently reading it as empty
+would turn the ratchet back into an off switch. A tool that fails and prints
+nothing parseable fails the step — an unparsed failure is not a baselined one.
+
 ## Adapters are commands, not plugins
 
 A plugin API would put the wrapper and the project on the same object graph and
@@ -61,6 +86,11 @@ are paths invoked with the project's own interpreter, so a project keeps its
 existing gate scripts and the tool stays dependency-free. The one contract the
 runner may satisfy beyond an exit code is the optional summary JSON that
 `devloop.report` reads for the failure output.
+
+The baseline adds a second optional contract, and it is a file rather than an
+import: a command that wants its findings frozen reads `DEVLOOP_FINDINGS_FILE`
+from the environment and appends one JSON object per finding. Commands that
+ignore it keep their exit-code semantics, so no existing adapter changes.
 
 ## Why not an off-the-shelf selector?
 

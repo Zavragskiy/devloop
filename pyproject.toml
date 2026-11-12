@@ -1,6 +1,6 @@
 [project]
 name = "devloop"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fast verification loop for Python projects: changed-file gates plus the tests a change affects"
 authors = [{ name = "Zavragskiy" }]
 license = "MIT"
@@ -49,6 +49,10 @@ select = ["E", "F", "I"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+
+[tool.devloop]
+source_roots = ["src/devloop"]
+shared = ["pyproject.toml", "poetry.lock"]
 
 [build-system]
 requires = ["poetry-core>=2.0"]

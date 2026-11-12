@@ -36,11 +36,11 @@ jobs:
       - name: Install project
         run: poetry install --no-interaction
       - name: Lint
-        run: poetry run ruff check src tests
+        run: poetry run ruff check src tests examples
       - name: Format
-        run: poetry run ruff format --check src tests
+        run: poetry run ruff format --check src tests examples
       - name: Types
-        run: poetry run mypy src
+        run: poetry run mypy src examples/runner/run_tests.py
       - name: Unit tests
         run: poetry run pytest
 

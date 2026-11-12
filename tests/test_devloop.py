@@ -15,7 +15,19 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from devloop import cli, config, gitinfo, graph, impact, report, selector, verdict  # noqa: E402
+from devloop import (  # noqa: E402
+    baseline,
+    cli,
+    config,
+    findings,
+    gitinfo,
+    graph,
+    impact,
+    report,
+    selector,
+    verdict,
+)
+from devloop.config import CheckSpec  # noqa: E402
 from devloop.gitinfo import Change  # noqa: E402
 
 SELECTOR = [sys.executable, "-c"]
@@ -416,14 +428,34 @@ class CliTest(unittest.TestCase):
 class RecordingSteps:
     """A ``Steps`` stand-in that records commands instead of running them."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        outputs: dict[str, str] | None = None,
+        reported: dict[str, list[findings.Finding]] | None = None,
+    ) -> None:
         self.commands: list[tuple[str, list[str]]] = []
         self.failures: list[str] = []
         self.seconds = 0.0
+        self.outputs = dict(outputs or {})
+        self.reported = dict(reported or {})
+        self.verdicts: dict[str, bool] = {}
 
     def run(self, label: str, command: list[str] | None) -> bool:
         self.commands.append((label, command or []))
         return True
+
+    def collect(self, label: str) -> list[findings.Finding]:
+        return list(self.reported.get(label, []))
+
+    def settle(self, label: str, ok: bool) -> None:
+        self.verdicts[label] = ok
+        if ok:
+            self.failures[:] = [failure for failure in self.failures if failure != label]
+        elif label not in self.failures:
+            self.failures.append(label)
+
+    def failure_output(self, label: str) -> str:
+        return self.outputs.get(label, "")
 
 
 class FailureReportTest(unittest.TestCase):
@@ -621,6 +653,380 @@ class GitOutputTest(unittest.TestCase):
     def test_output_is_empty_when_git_fails(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(gitinfo.output(Path(folder), "status"), "")
+
+
+class FindingsParsingTest(unittest.TestCase):
+    """Each tool's output becomes stable ``path:code`` keys."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.gettempdir()).resolve()
+
+    def test_ruff_json_is_keyed_by_path_and_code(self) -> None:
+        output = json.dumps(
+            [
+                {
+                    "code": "E501",
+                    "filename": str(self.root / "pkg" / "module.py"),
+                    "location": {"row": 12},
+                    "message": "Line too long",
+                },
+                {"code": None, "filename": "pkg/module.py", "location": {"row": 3}, "message": "?"},
+            ]
+        )
+        found = findings.parse_ruff(output, self.root)
+        self.assertEqual([item.key for item in found], ["pkg/module.py:E501", "pkg/module.py:misc"])
+        self.assertIn("pkg/module.py:12", found[0].message)
+
+    def test_ruff_output_before_the_array_is_ignored(self) -> None:
+        output = 'warning: something\n[{"code": "F401", "filename": "pkg/x.py"}]'
+        self.assertEqual(
+            [item.key for item in findings.parse_ruff(output, self.root)], ["pkg/x.py:F401"]
+        )
+
+    def test_ruff_output_that_is_not_json_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "did not print JSON"):
+            findings.parse_ruff("boom", self.root)
+
+    def test_mypy_errors_are_keyed_by_path_and_code(self) -> None:
+        output = (
+            "pkg/x.py:4: error: Need type annotation  [var-annotated]\n"
+            "pkg/x.py:5: error: no code here\n"
+            "pkg/x.py:6: note: a note is not a finding\n"
+            "Success: no issues found in 1 source file\n"
+        )
+        found = findings.parse_mypy(output, self.root)
+        self.assertEqual([item.key for item in found], ["pkg/x.py:var-annotated", "pkg/x.py:misc"])
+
+    def test_the_findings_report_needs_a_key(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "quality.jsonl"
+            path.write_text('{"key": "dupe-main@a.py"}\n{"message": "no key"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "has no key"):
+                findings.read_report(path, "quality")
+
+    def test_a_missing_report_is_empty(self) -> None:
+        self.assertEqual(findings.read_report(Path("nope.jsonl"), "quality"), [])
+
+
+class BaselineFileTest(unittest.TestCase):
+    """The file is sorted, versioned, and an unreadable one is an error."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        self.path = self.root / "devloop-baseline.json"
+
+    def test_a_round_trip_keeps_sorted_sets(self) -> None:
+        baseline.save(self.path, {"ruff": {"b.py:E501", "a.py:F401"}, "mypy": set()})
+        self.assertEqual(baseline.load(self.path), {"ruff": {"a.py:F401", "b.py:E501"}})
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn('"version": 1', text)
+        self.assertLess(text.index("a.py:F401"), text.index("b.py:E501"))
+
+    def test_a_corrupt_baseline_is_an_error(self) -> None:
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "is not JSON"):
+            baseline.load(self.path)
+
+    def test_a_wrong_version_is_an_error(self) -> None:
+        self.path.write_text('{"version": 2, "entries": {}}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "version 1"):
+            baseline.load(self.path)
+
+    def test_an_empty_baseline_can_be_absent(self) -> None:
+        cfg = fake_config(self.root, baseline=None)
+        self.assertIsNone(cli._baseline_entries(cfg))
+
+    def test_a_missing_file_turns_the_baseline_off(self) -> None:
+        cfg = fake_config(self.root, baseline=self.path)
+        self.assertIsNone(cli._baseline_entries(cfg))
+
+
+class BaselineCompareTest(unittest.TestCase):
+    """New findings fail, stale entries are a full-run warning."""
+
+    def _find(self, step: str, key: str) -> findings.Finding:
+        return findings.Finding(step, key, key)
+
+    def test_a_new_key_is_new(self) -> None:
+        result = baseline.compare(
+            {"ruff": {"a.py:E501"}},
+            {"ruff": [self._find("ruff", "b.py:E501")]},
+            ["ruff"],
+            full=False,
+        )
+        self.assertEqual([item.key for item in result.new["ruff"]], ["b.py:E501"])
+        self.assertTrue(result.has_new)
+
+    def test_a_known_key_is_accepted_and_counted(self) -> None:
+        result = baseline.compare(
+            {"ruff": {"a.py:E501"}},
+            {"ruff": [self._find("ruff", "a.py:E501")]},
+            ["ruff"],
+            full=False,
+        )
+        self.assertFalse(result.has_new)
+        self.assertEqual(result.known, 1)
+
+    def test_stale_entries_are_reported_only_on_a_full_run(self) -> None:
+        narrow = baseline.compare({"ruff": {"a.py:E501"}}, {}, ["ruff"], full=False)
+        self.assertEqual(narrow.stale, {})
+        full = baseline.compare({"ruff": {"a.py:E501"}}, {}, ["ruff"], full=True)
+        self.assertEqual(full.stale["ruff"], ("a.py:E501",))
+
+    def test_a_step_that_did_not_run_is_not_stale(self) -> None:
+        result = baseline.compare({"mypy": {"x.py:misc"}}, {}, ["ruff"], full=True)
+        self.assertEqual(result.stale, {})
+
+
+class BaselineStepTest(unittest.TestCase):
+    """With a baseline the steps are judged by keys, not by an exit code."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+
+    def _ruff_output(self, code: str) -> str:
+        payload = [
+            {"code": code, "filename": "pkg/module.py", "location": {"row": 2}, "message": "x"}
+        ]
+        return json.dumps(payload)
+
+    def test_ruff_runs_as_json_and_a_known_code_passes(self) -> None:
+        steps = RecordingSteps(outputs={"ruff": self._ruff_output("E501")})
+        cfg = fake_config(self.root)
+        cli._static_steps(
+            cfg, steps, ["pkg/module.py"], full=False, entries={"ruff": {"pkg/module.py:E501"}}
+        )
+        self.assertIn("--output-format", steps.commands[0][1])
+        self.assertTrue(steps.verdicts["ruff"])
+        self.assertNotIn("ruff", steps.failures)
+
+    def test_a_new_code_fails_the_ruff_step(self) -> None:
+        steps = RecordingSteps(outputs={"ruff": self._ruff_output("E501")})
+        cfg = fake_config(self.root)
+        cli._static_steps(cfg, steps, ["pkg/module.py"], full=False, entries={"ruff": set()})
+        self.assertFalse(steps.verdicts["ruff"])
+        self.assertIn("ruff", steps.failures)
+
+    def test_a_quality_script_is_judged_by_its_report(self) -> None:
+        known = findings.Finding("quality", "dupe-main@pkg/module.py", "dupe-main")
+        steps = RecordingSteps(reported={"quality": [known]})
+        steps.failures.append("quality")
+        cfg = fake_config(self.root)
+        cli._static_steps(
+            cfg,
+            steps,
+            ["pkg/module.py"],
+            full=False,
+            entries={"quality": {"dupe-main@pkg/module.py"}},
+        )
+        self.assertTrue(steps.verdicts["quality"])
+        self.assertNotIn("quality", steps.failures)
+
+
+class MypyScopeTest(unittest.TestCase):
+    """The mypy step follows the configured scope and the changed-only switch."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+
+    def test_the_scope_is_passed_positionally(self) -> None:
+        cfg = fake_config(self.root, mypy_scope=("pkg", "tools"))
+        command = cli._mypy_command(cfg, [], changed_only=False, baseline_mode=False)
+        self.assertEqual(command, [sys.executable, "-m", "mypy", "pkg", "tools"])
+
+    def test_changed_only_keeps_the_changed_files_inside_the_scope(self) -> None:
+        cfg = fake_config(self.root, mypy_scope=("pkg",))
+        command = cli._mypy_command(
+            cfg, ["pkg/a.py", "tests/test_a.py"], changed_only=True, baseline_mode=False
+        )
+        self.assertEqual(command, [sys.executable, "-m", "mypy", "pkg/a.py"])
+
+    def test_changed_only_with_nothing_in_scope_skips_the_step(self) -> None:
+        cfg = fake_config(self.root, mypy_scope=("pkg",))
+        self.assertIsNone(
+            cli._mypy_command(cfg, ["tests/test_a.py"], changed_only=True, baseline_mode=False)
+        )
+
+    def test_the_baseline_mode_asks_for_codes_and_no_summary(self) -> None:
+        cfg = fake_config(self.root)
+        command = cli._mypy_command(cfg, [], changed_only=False, baseline_mode=True)
+        self.assertIn("--show-error-codes", command)
+        self.assertIn("--no-error-summary", command)
+
+
+class StepEnvTest(unittest.TestCase):
+    """Every step subprocess sees the configured environment."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+
+    def test_a_configured_variable_reaches_the_step(self) -> None:
+        cfg = fake_config(self.root, env=(("QT_QPA_PLATFORM", "offscreen"),))
+        steps = cli.Steps(cfg, keep_going=False)
+        script = "import os; print(os.environ.get('QT_QPA_PLATFORM', 'missing'))"
+        steps.run("probe", [sys.executable, "-c", script])
+        self.assertIn("offscreen", steps.outputs["probe"])
+
+    def test_the_findings_file_reaches_the_step_and_is_collected(self) -> None:
+        cfg = fake_config(self.root)
+        steps = cli.Steps(cfg, keep_going=False)
+        script = (
+            "import os, pathlib;"
+            "pathlib.Path(os.environ['DEVLOOP_FINDINGS_FILE']).write_text("
+            "'{\"key\": \"dupe@pkg/x.py\"}\\n', encoding='utf-8')"
+        )
+        steps.run("quality", [sys.executable, "-c", script])
+        self.assertEqual([item.key for item in steps.collect("quality")], ["dupe@pkg/x.py"])
+
+
+class ExtraCheckTest(unittest.TestCase):
+    """``[[tool.devloop.check]]`` runs a project command as a pipeline step."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+
+    def _config(self, paths: str) -> config.Config:
+        spec = CheckSpec("plan-run", ("{python}", "scripts/plan_run.py"), paths)
+        return fake_config(self.root, checks=(spec,))
+
+    def test_a_none_check_gets_no_paths(self) -> None:
+        steps = RecordingSteps()
+        cli._static_steps(self._config("none"), steps, [], full=False)
+        labels = [label for label, _ in steps.commands]
+        self.assertIn("plan-run", labels)
+        self.assertEqual(dict(steps.commands)["plan-run"][1:], ["scripts/plan_run.py"])
+
+    def test_an_all_check_gets_the_whole_tree(self) -> None:
+        steps = RecordingSteps()
+        cli._static_steps(self._config("all"), steps, [], full=False)
+        command = dict(steps.commands)["plan-run"]
+        self.assertIn("pkg/module.py", command)
+        self.assertIn("tests/test_a.py", command)
+
+    def test_a_changed_check_is_skipped_without_changes(self) -> None:
+        steps = RecordingSteps()
+        cli._static_steps(self._config("changed"), steps, [], full=False)
+        self.assertNotIn("plan-run", [label for label, _ in steps.commands])
+
+    def test_a_failing_check_fails_the_pipeline(self) -> None:
+        steps = RecordingSteps()
+        steps.failures.append("plan-run")
+        cli._static_steps(self._config("none"), steps, [], full=False)
+        self.assertIn("plan-run", steps.failures)
+
+
+class ScriptedSteps(cli.Steps):
+    """A ``Steps`` that answers with canned output instead of running tools."""
+
+    ruff_output = "[]"
+
+    def __init__(self, cfg: config.Config, keep_going: bool, quiet: frozenset[str] = frozenset()):
+        super().__init__(cfg, keep_going, quiet)
+        self.ran: list[str] = []
+
+    def run(self, label: str, command: list[str] | None) -> bool:
+        self.ran.append(label)
+        self.outputs[label] = self.ruff_output if label == "ruff" else ""
+        return True
+
+
+class BaselineCommandTest(unittest.TestCase):
+    """``devloop baseline`` writes the frozen findings and refuses on a broken tool."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        self.path = self.root / "devloop-baseline.json"
+        self.cfg = fake_config(self.root, baseline=self.path)
+        self.args = fake_args()
+
+    def _run(self) -> int:
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.Steps", ScriptedSteps),
+        ):
+            return cli.run_baseline(self.args)
+
+    def test_the_observed_findings_are_written(self) -> None:
+        ScriptedSteps.ruff_output = json.dumps(
+            [{"code": "E501", "filename": "pkg/module.py", "location": {"row": 1}, "message": "x"}]
+        )
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(baseline.load(self.path), {"ruff": {"pkg/module.py:E501"}})
+
+    def test_a_failing_tool_writes_nothing(self) -> None:
+        class Broken(ScriptedSteps):
+            def run(self, label: str, command: list[str] | None) -> bool:
+                self.failures.append(label)
+                self.outputs[label] = "traceback"
+                return False
+
+        ScriptedSteps.ruff_output = "[]"
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.Steps", Broken),
+        ):
+            self.assertEqual(cli.run_baseline(self.args), 2)
+        self.assertFalse(self.path.exists())
+
+
+class RunnerExampleTest(unittest.TestCase):
+    """The example runner honours the adapter contract on a real project."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pyproject.toml", '[tool.devloop]\nsource_roots = ["pkg"]\n')
+        write(self.root, "pkg/__init__.py", "")
+        write(self.root, "tests/test_ok.py", "def test_ok():\n    assert True\n")
+        write(self.root, "tests/test_bad.py", "def test_bad():\n    assert False\n")
+
+    def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        example = Path(__file__).resolve().parents[1] / "examples" / "runner" / "run_tests.py"
+        return subprocess.run(
+            [sys.executable, str(example), *arguments],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+        )
+
+    def test_a_failing_shard_is_recorded_and_reported(self) -> None:
+        result = self._run("--files", "tests/test_ok.py", "tests/test_bad.py")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        summary = json.loads(
+            (self.root / ".devloop" / "run-tests.json").read_text(encoding="utf-8")
+        )
+        names = [shard["name"] for shard in summary["shards"]]
+        self.assertEqual(names, ["test_ok.py", "test_bad.py"])
+        failed = [shard for shard in summary["shards"] if shard["failed"]]
+        self.assertEqual(failed[0]["failed_tests"], ["tests/test_bad.py::test_bad"])
+        self.assertTrue((self.root / failed[0]["log"]).is_file())
+
+    def test_last_failed_replays_only_the_failures(self) -> None:
+        self._run("--files", "tests/test_ok.py", "tests/test_bad.py")
+        result = self._run("--last-failed")
+        self.assertEqual(result.returncode, 1)
+        summary = json.loads(
+            (self.root / ".devloop" / "run-tests.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([shard["name"] for shard in summary["shards"]], ["last-failed"])
 
 
 if __name__ == "__main__":

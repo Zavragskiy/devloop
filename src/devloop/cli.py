@@ -1,22 +1,26 @@
-"""The ``check``, ``impact``, ``changed`` and ``select-tests`` commands.
+"""The ``check``, ``baseline``, ``impact``, ``changed`` and ``select-tests`` commands.
 
 ``check`` is the pipeline: the static gates, then the tests affected by the
 change. ``--full`` checks every tracked file and runs the whole suite; a plain
-run is the edit loop. ``impact`` prints the selected files, ``changed`` lists
-the git entries the selection sees, and ``select-tests`` is the built-in
-selector command (one test path per line) that ``check`` runs by default.
+run is the edit loop. ``baseline`` freezes the findings a tree already has so
+that ``check`` fails only on new ones. ``impact`` prints the selected files,
+``changed`` lists the git entries the selection sees, and ``select-tests`` is the
+built-in selector command (one test path per line) that ``check`` runs by
+default.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
-from devloop import config, gitinfo, impact, report, selector, verdict
-from devloop.config import Config
+from devloop import baseline, config, findings, gitinfo, impact, report, selector, verdict
+from devloop.config import CheckSpec, Config
 
 
 def _python(cfg: Config, *arguments: str) -> list[str]:
@@ -35,24 +39,49 @@ def _all_python(cfg: Config) -> list[str]:
 
 
 def _is_source(cfg: Config, relative: str) -> bool:
-    return any(
-        relative == root.rstrip("/") or relative.startswith(root.rstrip("/") + "/")
-        for root in cfg.source_roots
-    )
+    return any(_is_under(relative, root) for root in cfg.source_roots)
+
+
+def _is_under(relative: str, root: str) -> bool:
+    root = root.rstrip("/")
+    return relative == root or relative.startswith(root + "/")
+
+
+def _slug(label: str) -> str:
+    """A file-system-safe form of a step name."""
+    clean = "".join(char if char.isalnum() or char in "-_" else "-" for char in label)
+    return clean.strip("-") or "step"
+
+
+def _tail(output: str, limit: int = 20) -> str:
+    lines = output.rstrip().splitlines()
+    return "\n".join(lines[-limit:])
 
 
 class Steps:
     """Run verification steps in order, timing them and stopping on failure."""
 
-    def __init__(self, cfg: Config, keep_going: bool):
+    def __init__(self, cfg: Config, keep_going: bool, quiet: frozenset[str] = frozenset()):
         self.cfg = cfg
         self.keep_going = keep_going
+        self.quiet = quiet
         self.failures: list[str] = []
         self.seconds: float = 0.0
+        self.outputs: dict[str, str] = {}
 
     @property
     def stopped(self) -> bool:
         return bool(self.failures) and not self.keep_going
+
+    def report_path(self, label: str) -> Path:
+        """Where a step writes the findings it wants the baseline to see."""
+        return self.cfg.cache_dir / "findings" / f"{_slug(label)}.jsonl"
+
+    def _environment(self, label: str) -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(self.cfg.environment)
+        env["DEVLOOP_FINDINGS_FILE"] = str(self.report_path(label))
+        return env
 
     def run(self, label: str, command: list[str] | None) -> bool:
         """Run one step; True when it passed or was skipped."""
@@ -60,66 +89,162 @@ class Steps:
             return True
         print(f"[verify] {label} ...")
         started = time.monotonic()
-        code = subprocess.run(command, cwd=self.cfg.root, text=True).returncode
+        path = self.report_path(label)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        result = subprocess.run(
+            command,
+            cwd=self.cfg.root,
+            text=True,
+            capture_output=True,
+            env=self._environment(label),
+        )
         elapsed = time.monotonic() - started
         self.seconds += elapsed
-        print(f"[verify] {label}: {'ok' if code == 0 else 'FAILED'} ({elapsed:.1f}s)")
-        if code != 0:
+        output = (result.stdout or "") + (result.stderr or "")
+        self.outputs[label] = output
+        if output and label not in self.quiet:
+            print(output, end="" if output.endswith("\n") else "\n")
+        print(f"[verify] {label}: {'ok' if result.returncode == 0 else 'FAILED'} ({elapsed:.1f}s)")
+        if result.returncode != 0:
             self.failures.append(label)
-        return code == 0
+        return result.returncode == 0
+
+    def collect(self, label: str) -> list[findings.Finding]:
+        """The findings a step wrote for this run."""
+        return findings.read_report(self.report_path(label), label)
+
+    def settle(self, label: str, ok: bool) -> None:
+        """Record or clear the failure of a step whose verdict is decided later."""
+        if ok:
+            self.failures[:] = [failure for failure in self.failures if failure != label]
+        elif label not in self.failures:
+            self.failures.append(label)
+
+    def failure_output(self, label: str) -> str:
+        """The captured output of a quiet step, for a failure that parsed nothing."""
+        return self.outputs.get(label, "")
 
 
-def run_check(args: argparse.Namespace) -> int:
-    cfg = config.load()
-    changes = gitinfo.collect(cfg.root, args.base)
-    files = _changed_python(cfg, changes)
-    scope = " (full)" if args.full else ""
-    print(f"[verify] {_changed_count(changes)} changed, {len(files)} Python file(s){scope}")
-
-    key = _cache_key(cfg, args)
-    if key is not None and verdict.recent(cfg, key):
-        print("[verify] this tree already passed the full gate; nothing to re-check")
-        return 0
-    steps = Steps(cfg, args.keep_going)
-    _static_steps(cfg, steps, files, args.full)
-    _test_step(cfg, steps, changes, args)
-    code = _finish(steps)
-    if code == 0 and key is not None:
-        verdict.remember(cfg, key)
-    return code
+def _collected(steps: Steps, label: str) -> list[findings.Finding]:
+    collect = getattr(steps, "collect", None)
+    return collect(label) if callable(collect) else []
 
 
-def _cache_key(cfg: Config, args: argparse.Namespace) -> str | None:
-    """The tree key when this run may be replayed from the cache, else ``None``."""
-    cacheable = args.full and not args.base and not args.no_cache and not args.no_tests
-    if not cacheable or _explicit_selection(args):
-        return None
-    return verdict.tree_key(cfg)
+def _settle(
+    steps: Steps,
+    label: str,
+    found: list[findings.Finding],
+    entries: dict[str, set[str]],
+    full: bool,
+) -> None:
+    """Decide one step by what a baseline already accepts."""
+    comparison = baseline.compare(entries, {label: found}, [label], full=full)
+    fresh = list(comparison.new.get(label, ()))
+    known_keys = entries.get(label, set())
+    known = sum(1 for finding in found if finding.key in known_keys)
+    if fresh:
+        report.new_findings(label, fresh, known)
+        steps.settle(label, ok=False)
+    elif found:
+        report.new_findings(label, [], known)
+        steps.settle(label, ok=True)
+    elif label in steps.failures:
+        output = steps.failure_output(label)
+        if output.strip():
+            print(f"[verify] {label}: the tool failed without a finding:")
+            for line in _tail(output).splitlines():
+                print(f"  {line}")
+    stale = list(comparison.stale.get(label, ()))
+    if stale:
+        report.stale_entries(label, stale)
 
 
-def _changed_count(changes: list[gitinfo.Change]) -> int:
-    return sum(1 for change in changes if not change.deleted)
-
-
-def _changed_python(cfg: Config, changes: list[gitinfo.Change]) -> list[str]:
-    return [
-        change.path
-        for change in changes
-        if not change.deleted and change.path.endswith(".py") and (cfg.root / change.path).is_file()
-    ]
-
-
-def _static_steps(cfg: Config, steps: Steps, files: list[str], full: bool) -> None:
+def _static_steps(
+    cfg: Config,
+    steps: Steps,
+    files: list[str],
+    full: bool,
+    *,
+    entries: dict[str, set[str]] | None = None,
+    changed_only: bool = False,
+) -> None:
     gated = _all_python(cfg) if full else files
     if gated:
-        steps.run("ruff", _python(cfg, "-m", "ruff", "check", *gated))
+        if entries is None:
+            steps.run("ruff", _python(cfg, "-m", "ruff", "check", *gated))
+        else:
+            steps.run(
+                "ruff",
+                _python(
+                    cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero", *gated
+                ),
+            )
+            found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
+            _settle(steps, "ruff", found, entries, full)
         steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *gated))
     if cfg.quality is not None and gated:
         steps.run("quality", _python(cfg, str(cfg.quality), *gated))
+        if entries is not None:
+            _settle(steps, "quality", _collected(steps, "quality"), entries, full)
     if cfg.policy is not None:
         steps.run("policy", _python(cfg, str(cfg.policy)))
     if full or any(_is_source(cfg, path) for path in files):
-        steps.run("mypy", _python(cfg, "-m", "mypy"))
+        frozen = entries is not None
+        command = _mypy_command(cfg, files, changed_only=changed_only, baseline_mode=frozen)
+        if command is None:
+            print("[verify] mypy: skipped (no changed files in scope)")
+        else:
+            steps.run("mypy", command)
+            if entries is not None:
+                found = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
+                _settle(steps, "mypy", found, entries, full)
+    for spec in cfg.checks:
+        _run_check(cfg, steps, spec, files, entries, full)
+
+
+def _run_check(
+    cfg: Config,
+    steps: Steps,
+    spec: CheckSpec,
+    files: list[str],
+    entries: dict[str, set[str]] | None,
+    full: bool,
+) -> None:
+    """Run one ``[[tool.devloop.check]]`` command with the paths it asked for."""
+    if spec.paths == "changed":
+        if not files:
+            print(f"[verify] {spec.name}: skipped (no changed files)")
+            return
+        targets = list(files)
+    else:
+        targets = _all_python(cfg) if spec.paths == "all" else []
+    command = [*cfg.resolve_command(spec.command), *targets]
+    steps.run(spec.name, command)
+    if entries is not None:
+        _settle(steps, spec.name, _collected(steps, spec.name), entries, full)
+
+
+def _scope_targets(cfg: Config, files: list[str]) -> list[str]:
+    if not cfg.mypy_scope:
+        return list(files)
+    return [path for path in files if any(_is_under(path, scope) for scope in cfg.mypy_scope)]
+
+
+def _mypy_command(
+    cfg: Config, files: list[str], *, changed_only: bool, baseline_mode: bool
+) -> list[str] | None:
+    """``mypy`` over the configured scope, or over the changed files only."""
+    options = ["-m", "mypy"]
+    if baseline_mode:
+        options += ["--show-error-codes", "--no-error-summary"]
+    if changed_only:
+        targets = _scope_targets(cfg, files)
+        return _python(cfg, *options, *targets) if targets else None
+    return _python(cfg, *options, *cfg.mypy_scope)
 
 
 def _test_step(
@@ -228,6 +353,112 @@ def _finish(steps: Steps) -> int:
     return 0
 
 
+def _cache_key(cfg: Config, args: argparse.Namespace) -> str | None:
+    """The tree key when this run may be replayed from the cache, else ``None``."""
+    cacheable = args.full and not args.base and not args.no_cache and not args.no_tests
+    if not cacheable or _explicit_selection(args):
+        return None
+    return verdict.tree_key(cfg)
+
+
+def _baseline_entries(cfg: Config) -> dict[str, set[str]] | None:
+    """The committed baseline, or ``None`` when the project does not use one."""
+    if cfg.baseline is None or not cfg.baseline.is_file():
+        return None
+    return baseline.load(cfg.baseline)
+
+
+def run_check(args: argparse.Namespace) -> int:
+    cfg = config.load()
+    changes = gitinfo.collect(cfg.root, args.base)
+    files = _changed_python(cfg, changes)
+    scope = " (full)" if args.full else ""
+    print(f"[verify] {_changed_count(changes)} changed, {len(files)} Python file(s){scope}")
+
+    key = _cache_key(cfg, args)
+    if key is not None and verdict.recent(cfg, key):
+        print("[verify] this tree already passed the full gate; nothing to re-check")
+        return 0
+    entries = _baseline_entries(cfg)
+    quiet = frozenset({"ruff", "mypy"}) if entries is not None else frozenset()
+    steps = Steps(cfg, args.keep_going, quiet=quiet)
+    _static_steps(
+        cfg,
+        steps,
+        files,
+        args.full,
+        entries=entries,
+        changed_only=args.changed_only,
+    )
+    _test_step(cfg, steps, changes, args)
+    code = _finish(steps)
+    if code == 0 and key is not None:
+        verdict.remember(cfg, key)
+    return code
+
+
+def _changed_count(changes: list[gitinfo.Change]) -> int:
+    return sum(1 for change in changes if not change.deleted)
+
+
+def _changed_python(cfg: Config, changes: list[gitinfo.Change]) -> list[str]:
+    return [
+        change.path
+        for change in changes
+        if not change.deleted and change.path.endswith(".py") and (cfg.root / change.path).is_file()
+    ]
+
+
+def run_baseline(args: argparse.Namespace) -> int:
+    """Freeze the findings the whole tree has today into the baseline file."""
+    cfg = config.load()
+    if cfg.baseline is None:
+        raise ValueError('the baseline is disabled by [tool.devloop] baseline = ""')
+    targets = _all_python(cfg)
+    steps = Steps(cfg, keep_going=False, quiet=frozenset({"ruff", "mypy"}))
+    observed: dict[str, list[findings.Finding]] = {}
+    broken: list[str] = []
+
+    if targets:
+        steps.run(
+            "ruff",
+            _python(cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero", *targets),
+        )
+        try:
+            observed["ruff"] = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
+        except ValueError as error:
+            print(f"devloop: {error}", file=sys.stderr)
+            return 2
+        if "ruff" in steps.failures:
+            broken.append("ruff")
+        command = _mypy_command(cfg, targets, changed_only=False, baseline_mode=True)
+        if command is not None:
+            steps.run("mypy", command)
+            observed["mypy"] = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
+            if "mypy" in steps.failures and not observed["mypy"]:
+                broken.append("mypy")
+    if cfg.quality is not None and targets:
+        steps.run("quality", _python(cfg, str(cfg.quality), *targets))
+        observed["quality"] = _collected(steps, "quality")
+        if "quality" in steps.failures and not observed["quality"]:
+            broken.append("quality")
+    for spec in cfg.checks:
+        _run_check(cfg, steps, spec, targets, None, True)
+        observed[spec.name] = _collected(steps, spec.name)
+        if spec.name in steps.failures and not observed[spec.name]:
+            broken.append(spec.name)
+    if broken:
+        print(f"devloop: the baseline was not written: {', '.join(broken)} failed", file=sys.stderr)
+        return 2
+    baseline.save(
+        cfg.baseline, {step: [found.key for found in items] for step, items in observed.items()}
+    )
+    for step in sorted(observed):
+        print(f"[verify] {step}: {len(observed[step])} finding(s)")
+    print(f"[verify] baseline written to {cfg.baseline}")
+    return 0
+
+
 def run_impact(args: argparse.Namespace) -> int:
     cfg = config.load()
     selection = impact.select(
@@ -260,6 +491,10 @@ commit and stage gate). Reach for --full before a commit or at the end of a
 stage, not after every edit. A green --full run is remembered for the exact
 tree it gated, so repeating it on an unchanged tree answers in about a second;
 --no-cache ignores that record.
+
+A baseline file (devloop-baseline.json unless configured otherwise) freezes the
+findings a tree already has: check fails only on new ones, and --full names the
+entries that no longer match. devloop baseline rewrites it from the whole tree.
 """
 
 DESCRIPTION = """\
@@ -279,10 +514,10 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
         "command",
         nargs="?",
         default=default,
-        choices=("check", "impact", "changed", "select-tests"),
-        help="check runs the pipeline (default); impact prints the selected test files; "
-        "changed lists the git changes the selection sees; select-tests prints the test "
-        "files the built-in selector picks",
+        choices=("check", "baseline", "impact", "changed", "select-tests"),
+        help="check runs the pipeline (default); baseline freezes today's findings; "
+        "impact prints the selected test files; changed lists the git changes the "
+        "selection sees; select-tests prints the test files the built-in selector picks",
     )
     parser.add_argument(
         "--full",
@@ -293,6 +528,11 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
     parser.add_argument("--base", default=None, help="compare against this git ref")
     parser.add_argument("--jobs", type=int, default=0, help="test shards to run in parallel")
     parser.add_argument("--no-tests", action="store_true", help="skip the test step")
+    parser.add_argument(
+        "--changed-only",
+        action="store_true",
+        help="mypy checks the changed files (inside the configured scope) even on --full",
+    )
     parser.add_argument(
         "--files",
         nargs="+",
@@ -327,6 +567,8 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
 def main(argv: list[str] | None = None, default: str = "check", prog: str = "devloop") -> int:
     args = build_parser(default, prog).parse_args(argv)
     try:
+        if args.command == "baseline":
+            return run_baseline(args)
         if args.command == "impact":
             return run_impact(args)
         if args.command == "changed":

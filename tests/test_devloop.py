@@ -449,6 +449,13 @@ class RecordingSteps:
         self.commands.append((label, command or []))
         return True
 
+    def run_batched(
+        self, label: str, commands: list[list[str]], *, defer_status: bool = False
+    ) -> bool:
+        for command in commands:
+            self.run(label, command, defer_status=defer_status)
+        return True
+
     def collect(self, label: str) -> list[findings.Finding]:
         return list(self.reported.get(label, []))
 
@@ -557,6 +564,127 @@ class FullStaticStepsTest(unittest.TestCase):
         commands = self._commands(["pkg/module.py"], full=False)
         self.assertIn("pkg/module.py", commands["ruff"])
         self.assertNotIn("tests/test_a.py", commands["ruff"])
+
+
+class CommandLineLimitTest(unittest.TestCase):
+    """A whole-tree gate must not put the whole tree on one command line.
+
+    ``CreateProcess`` on Windows refuses a line over 32767 characters, so a full
+    run of a large project failed before its first step started.
+    """
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        for number in range(40):
+            write(self.root, f"pkg/module_{number:02d}.py", "")
+        self.paths = [f"pkg/module_{number:02d}.py" for number in range(40)]
+
+    def test_batches_fit_the_limit_and_carry_every_path_once(self) -> None:
+        prefix = [sys.executable, "-m", "ruff", "check"]
+        batches = cli._batched(prefix, self.paths, budget=400)
+        self.assertGreater(len(batches), 1)
+        for batch in batches:
+            self.assertEqual(batch[: len(prefix)], prefix)
+            self.assertLessEqual(process.command_length(batch), 400)
+        self.assertEqual([path for batch in batches for path in batch[len(prefix) :]], self.paths)
+
+    def test_a_short_list_stays_one_invocation(self) -> None:
+        prefix = [sys.executable, "-m", "ruff", "check"]
+        self.assertEqual(cli._batched(prefix, ["pkg/a.py"]), [[*prefix, "pkg/a.py"]])
+
+    def test_a_full_run_ruffs_the_tree_in_several_invocations(self) -> None:
+        steps = RecordingSteps()
+        cfg = fake_config(self.root, quality=None)
+        with patch("devloop.cli._argv_budget", return_value=120):
+            cli._static_steps(cfg, steps, [], full=True)
+        ruff = [command for label, command in steps.commands if label == "ruff"]
+        self.assertGreater(len(ruff), 1)
+        for command in ruff:
+            self.assertLessEqual(process.command_length(command), 120)
+        self.assertEqual([part for command in ruff for part in command[4:]], self.paths)
+
+    def test_batches_are_merged_behind_one_report(self) -> None:
+        cfg = fake_config(self.root)
+        steps = cli.Steps(cfg, keep_going=True)
+        payloads = [
+            [{"code": "E501", "filename": "pkg/a.py", "location": {"row": 1}, "message": "long"}],
+            [{"code": "F401", "filename": "pkg/b.py", "location": {"row": 2}, "message": "unused"}],
+        ]
+
+        def fake_run(command, *, cwd, env=None):
+            number = fake_run.calls
+            fake_run.calls += 1
+            Path(env["DEVLOOP_FINDINGS_FILE"]).write_text(
+                json.dumps({"key": f"script-{number}"}) + "\n", encoding="utf-8"
+            )
+            return process.Result(0, json.dumps(payloads[number]), "")
+
+        fake_run.calls = 0
+        output = StringIO()
+        with (
+            patch("devloop.cli.process.run", side_effect=fake_run),
+            redirect_stdout(output),
+        ):
+            passed = steps.run_batched("quality", [["quality", "a.py"], ["quality", "b.py"]])
+        self.assertTrue(passed)
+        self.assertEqual(
+            [finding.key for finding in steps.collect("quality")], ["script-0", "script-1"]
+        )
+        self.assertEqual(len(findings.parse_ruff(steps.outputs["quality"], self.root)), 2)
+        self.assertEqual(output.getvalue().count("[verify] quality ..."), 1)
+        self.assertEqual(output.getvalue().count("[verify] quality: ok"), 1)
+
+    def test_one_failing_batch_fails_the_step_once(self) -> None:
+        steps = cli.Steps(fake_config(self.root), keep_going=True)
+        results = [process.Result(0, "", ""), process.Result(1, "boom\n", "")]
+        with (
+            patch("devloop.cli.process.run", side_effect=results),
+            redirect_stdout(StringIO()),
+        ):
+            passed = steps.run_batched("ruff", [["ruff", "a.py"], ["ruff", "b.py"]])
+        self.assertFalse(passed)
+        self.assertEqual(steps.failures, ["ruff"])
+
+    def test_baseline_collection_merges_every_ruff_batch(self) -> None:
+        cfg = fake_config(self.root, quality=None)
+        steps = cli.Steps(cfg, keep_going=True)
+
+        def fake_run(command, *, cwd, env=None):
+            if "-m" in command and "ruff" in command and "check" in command:
+                name = Path(command[-1]).name
+                payload = [
+                    {
+                        "code": "E501",
+                        "filename": f"pkg/{name}",
+                        "location": {"row": 1},
+                        "message": "long",
+                    }
+                ]
+                return process.Result(0, json.dumps(payload), "")
+            return process.Result(0, "", "")
+
+        with (
+            patch("devloop.cli.process.run", side_effect=fake_run),
+            patch("devloop.cli._argv_budget", return_value=120),
+            redirect_stdout(StringIO()),
+        ):
+            observed = cli._collect_findings(cfg, steps)
+        self.assertIsNotNone(observed)
+        assert observed is not None
+        expected = {f"{path}:E501" for path in self.paths}
+        self.assertEqual({finding.key for finding in observed["ruff"]}, expected)
+
+
+class CommandLengthGuardTest(unittest.TestCase):
+    """An over-long line is refused with its length, not a bare ``WinError 206``."""
+
+    def test_the_length_is_measured_before_the_process_is_spawned(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("devloop.process.MAX_COMMAND_LINE", 40):
+                with self.assertRaisesRegex(ValueError, "over the 40-character limit"):
+                    process.run([sys.executable, "-c", "pass"], cwd=Path(folder))
 
 
 class VerifySelectionTest(unittest.TestCase):

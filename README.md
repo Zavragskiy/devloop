@@ -146,7 +146,10 @@ stale, so CI can keep the accepted debt from rotting.
 step subprocess, and `[[tool.devloop.check]]` runs an extra project command — an
 acceptance shard, a plan-run step — inside the same pipeline, with
 `paths = "none"`, `"changed"` or `"all"`. The mypy scope that grows package by
-package lives in `[tool.devloop.mypy]`. See
+package lives in `[tool.devloop.mypy]`. A whole-tree path list that would
+overflow the operating system's command line (the 32767-character Windows limit)
+is split over several invocations and merged behind one step, so a large project
+gates in one run on every platform. See
 [Integration](docs/integration.md).
 
 ## Hosting

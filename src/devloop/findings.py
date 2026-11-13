@@ -47,24 +47,32 @@ def _relative(root: Path, raw: str) -> str:
 
 
 def _payload(output: str) -> list[object]:
-    """The JSON array in the output, ignoring anything before it."""
+    """The JSON array in the output, ignoring anything before it.
+
+    A batched step prints one array per invocation, so a run reads them all and
+    merges the items: the baseline must see the same findings no matter how many
+    command lines the gated file list took.
+    """
     text = output.strip()
     if not text:
         return []
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start < 0 or end < start:
-            raise ValueError("the tool did not print JSON") from None
+    start = text.find("[")
+    if start < 0:
+        raise ValueError("the tool did not print JSON")
+    decoder = json.JSONDecoder()
+    items: list[object] = []
+    index = start
+    while index < len(text) and text[index] == "[":
         try:
-            parsed = json.loads(text[start : end + 1])
+            parsed, index = decoder.raw_decode(text, index)
         except ValueError as error:
             raise ValueError(f"the tool JSON is malformed: {error}") from error
-    if not isinstance(parsed, list):
-        raise ValueError("the tool JSON is not a list")
-    return parsed
+        if not isinstance(parsed, list):
+            raise ValueError("the tool JSON is not a list")
+        items.extend(parsed)
+        while index < len(text) and text[index].isspace():
+            index += 1
+    return items
 
 
 def parse_ruff(output: str, root: Path, step: str = "ruff") -> list[Finding]:

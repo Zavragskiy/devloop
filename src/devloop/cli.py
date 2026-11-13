@@ -47,6 +47,37 @@ def _all_python(cfg: Config) -> list[str]:
     return files
 
 
+def _argv_budget() -> int:
+    """How much of the platform command line one invocation may occupy."""
+    return max(1024, process.MAX_COMMAND_LINE - 1024)
+
+
+def _batched(prefix: list[str], targets: list[str], budget: int | None = None) -> list[list[str]]:
+    """``prefix`` and the targets split over as few invocations as the limit allows.
+
+    A full-tree gate names every source and test file, and a few hundred paths
+    already overflow the 32767-character Windows command line (``WinError 206``).
+    Nothing about the file set changes: read in order, the batches carry exactly
+    ``targets``, so the findings and the baseline keys are the same on every
+    platform and for every tree size. Quoting is counted with the same routine
+    ``subprocess`` uses, so the measurement is the one ``CreateProcess`` sees.
+    """
+    limit = _argv_budget() if budget is None else budget
+    batches: list[list[str]] = []
+    current = list(prefix)
+    length = process.command_length(current)
+    for target in targets:
+        cost = process.command_length([target]) + 1
+        if len(current) > len(prefix) and length + cost > limit:
+            batches.append(current)
+            current = list(prefix)
+            length = process.command_length(current)
+        current.append(target)
+        length += cost
+    batches.append(current)
+    return batches
+
+
 def _is_source(cfg: Config, relative: str) -> bool:
     return any(_is_under(relative, root) for root in cfg.source_roots)
 
@@ -65,6 +96,13 @@ def _slug(label: str) -> str:
 def _tail(output: str, limit: int = 20) -> str:
     lines = output.rstrip().splitlines()
     return "\n".join(lines[-limit:])
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 class Steps:
@@ -108,10 +146,7 @@ class Steps:
         started = time.monotonic()
         path = self.report_path(label)
         path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        _unlink(path)
         result = process.run(command, cwd=self.cfg.root, env=self._environment(label))
         elapsed = time.monotonic() - started
         self.seconds += elapsed
@@ -120,6 +155,61 @@ class Steps:
         if output and label not in self.quiet:
             print(output, end="" if output.endswith("\n") else "\n")
         passed = result.returncode == 0
+        if defer_status:
+            self.pending[label] = (passed, elapsed)
+        else:
+            print(f"[verify] {label}: {'ok' if passed else 'FAILED'} ({elapsed:.1f}s)")
+        if not passed:
+            self.failures.append(label)
+        return passed
+
+    def run_batched(
+        self, label: str, commands: list[list[str]], *, defer_status: bool = False
+    ) -> bool:
+        """Run one step over several argument batches and merge what they reported.
+
+        ``commands`` is what :func:`_batched` produced: the same tool called with
+        a slice of the gated paths each time. One batch is exactly :meth:`run`.
+        More than one accumulates the outputs in order and joins the per-batch
+        finding files behind this step's single report path, so the concatenated
+        ``ruff`` JSON still parses as one stream and a project command that
+        appends to ``DEVLOOP_FINDINGS_FILE`` keeps every batch's entries. The
+        caller sees one step: one header, one timing line, one failure.
+        """
+        if self.stopped or not commands:
+            return True
+        if len(commands) == 1:
+            return self.run(label, commands[0], defer_status=defer_status)
+        self.ran.add(label)
+        print(f"[verify] {label} ...")
+        started = time.monotonic()
+        path = self.report_path(label)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        parts: list[Path] = []
+        chunks: list[str] = []
+        passed = True
+        for number, command in enumerate(commands, 1):
+            part = path.with_name(f"{path.stem}.{number}{path.suffix}")
+            _unlink(part)
+            parts.append(part)
+            env = self._environment(label)
+            env["DEVLOOP_FINDINGS_FILE"] = str(part)
+            result = process.run(command, cwd=self.cfg.root, env=env)
+            chunk = result.stdout + result.stderr
+            chunks.append(chunk if not chunk or chunk.endswith("\n") else chunk + "\n")
+            passed = passed and result.returncode == 0
+        elapsed = time.monotonic() - started
+        self.seconds += elapsed
+        _unlink(path)
+        with path.open("w", encoding="utf-8") as merged:
+            for part in parts:
+                if part.is_file():
+                    merged.write(part.read_text(encoding="utf-8"))
+                _unlink(part)
+        output = "".join(chunks)
+        self.outputs[label] = output
+        if output and label not in self.quiet:
+            print(output, end="" if output.endswith("\n") else "\n")
         if defer_status:
             self.pending[label] = (passed, elapsed)
         else:
@@ -203,29 +293,30 @@ def _static_steps(
     gated = _all_python(cfg) if full else files
     if gated:
         if entries is None:
-            steps.run("ruff", _python(cfg, "-m", "ruff", "check", *gated))
+            steps.run_batched("ruff", _batched(_python(cfg, "-m", "ruff", "check"), gated))
         else:
-            steps.run(
+            steps.run_batched(
                 "ruff",
-                _python(
-                    cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero", *gated
+                _batched(
+                    _python(cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero"),
+                    gated,
                 ),
                 defer_status=True,
             )
             found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
             _settle(steps, "ruff", found, entries, full, detail=True)
-        steps.run(
+        steps.run_batched(
             "format",
-            _python(cfg, "-m", "ruff", "format", "--check", *gated),
+            _batched(_python(cfg, "-m", "ruff", "format", "--check"), gated),
             defer_status=entries is not None,
         )
         if entries is not None:
             found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
             _settle(steps, "format", found, entries, full)
     if cfg.quality is not None and gated:
-        steps.run(
+        steps.run_batched(
             "quality",
-            _python(cfg, str(cfg.quality), *gated),
+            _batched(_python(cfg, str(cfg.quality)), gated),
             defer_status=entries is not None,
         )
         if entries is not None:
@@ -270,8 +361,9 @@ def _run_check(
         targets = list(files)
     else:
         targets = _all_python(cfg) if spec.paths == "all" else []
-    command = [*cfg.resolve_command(spec.command), *targets]
-    steps.run(spec.name, command, defer_status=defer_status or entries is not None)
+    command = cfg.resolve_command(spec.command)
+    deferred = defer_status or entries is not None
+    steps.run_batched(spec.name, _batched(command, targets), defer_status=deferred)
     if entries is not None:
         _settle(steps, spec.name, _collected(steps, spec.name), entries, full)
 
@@ -463,9 +555,12 @@ def _collect_findings(cfg: Config, steps: Steps) -> dict[str, list[findings.Find
     observed: dict[str, list[findings.Finding]] = {}
     broken: list[str] = []
     if targets:
-        steps.run(
+        steps.run_batched(
             "ruff",
-            _python(cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero", *targets),
+            _batched(
+                _python(cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero"),
+                targets,
+            ),
         )
         try:
             observed["ruff"] = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
@@ -473,8 +568,10 @@ def _collect_findings(cfg: Config, steps: Steps) -> dict[str, list[findings.Find
             print(f"devloop: {error}", file=sys.stderr)
             return None
         _collect_verdict(steps, "ruff", observed["ruff"], broken)
-        steps.run(
-            "format", _python(cfg, "-m", "ruff", "format", "--check", *targets), defer_status=True
+        steps.run_batched(
+            "format",
+            _batched(_python(cfg, "-m", "ruff", "format", "--check"), targets),
+            defer_status=True,
         )
         observed["format"] = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
         _collect_verdict(steps, "format", observed["format"], broken)
@@ -484,7 +581,9 @@ def _collect_findings(cfg: Config, steps: Steps) -> dict[str, list[findings.Find
             observed["mypy"] = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
             _collect_verdict(steps, "mypy", observed["mypy"], broken)
     if cfg.quality is not None and targets:
-        steps.run("quality", _python(cfg, str(cfg.quality), *targets), defer_status=True)
+        steps.run_batched(
+            "quality", _batched(_python(cfg, str(cfg.quality)), targets), defer_status=True
+        )
         observed["quality"] = _collected(steps, "quality")
         _collect_verdict(steps, "quality", observed["quality"], broken)
     for spec in cfg.checks:

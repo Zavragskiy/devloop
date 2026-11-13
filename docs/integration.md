@@ -88,7 +88,9 @@ selector = ["{python}", "tools/select_tests.py"]
 
 `quality` is called as `<project python> <quality> <Python file paths...>` with
 the changed files, or every source and test file on `--full`. It must return a
-nonzero exit code on failure. Omit it (or set it empty) to skip the step.
+nonzero exit code on failure. Omit it (or set it empty) to skip the step. A list
+too long for one command line is split over several calls, each with a slice of
+the paths; see [Command-line length](#command-line-length).
 
 ```toml
 quality = "tools/check_quality.py"
@@ -202,7 +204,35 @@ that must cover the whole tree in the commit gate uses `all`; `changed` is for
 the edit loop. A nonzero exit fails the step and the pipeline. With a baseline in
 play the step also receives `DEVLOOP_FINDINGS_FILE`, and its keys land under
 `name` in the baseline file. Names must be unique; the order of the tables is
-the order the checks run in.
+the order the checks run in. A long path list is split over several calls, so a
+`paths = "all"` check must not assume it sees the whole tree at once; see
+[Command-line length](#command-line-length).
+
+### Command-line length
+
+The operating system caps how long a command line may be: `CreateProcess` on
+Windows rejects anything over 32767 characters with `ERROR_FILENAME_EXCED_RANGE`
+(`[WinError 206]`), and Linux caps the whole `argv` at `ARG_MAX`. A full-tree
+gate reaches that with a few hundred files, so devloop measures every command
+with the same quoting `subprocess` uses and, when the paths do not fit, calls the
+tool more than once with a slice of them:
+
+- `ruff check`, `ruff format --check`, `quality` and `paths = "all"` checks are
+  batched; read in order, the batches carry exactly the file set the run
+  computed, so the findings and the baseline keys do not depend on the batching
+  or the platform;
+- the batches are merged behind one step: the captured outputs are concatenated
+  (several ruff JSON arrays parse as one stream) and every invocation of a
+  project command gets its own `DEVLOOP_FINDINGS_FILE`, whose entries devloop
+  concatenates into the step's report file;
+- the step still prints one header, one timing line and one failure, so a
+  batched run looks like any other run.
+
+What is not split: mypy (it is called with the scope directories, not the file
+list), `policy`, and the test runner's selection. A command that cannot be made
+to fit — a single path longer than the limit, or a custom tool invoked with too
+many arguments — is refused before it is spawned, with the measured length and
+the platform limit instead of a bare `WinError 206`.
 
 ## Baseline
 

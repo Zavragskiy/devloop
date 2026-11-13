@@ -583,11 +583,12 @@ class CommandLineLimitTest(unittest.TestCase):
 
     def test_batches_fit_the_limit_and_carry_every_path_once(self) -> None:
         prefix = [sys.executable, "-m", "ruff", "check"]
-        batches = cli._batched(prefix, self.paths, budget=400)
+        budget = process.command_length(prefix) + 60
+        batches = cli._batched(prefix, self.paths, budget=budget)
         self.assertGreater(len(batches), 1)
         for batch in batches:
             self.assertEqual(batch[: len(prefix)], prefix)
-            self.assertLessEqual(process.command_length(batch), 400)
+            self.assertLessEqual(process.command_length(batch), budget)
         self.assertEqual([path for batch in batches for path in batch[len(prefix) :]], self.paths)
 
     def test_a_short_list_stays_one_invocation(self) -> None:
@@ -597,13 +598,15 @@ class CommandLineLimitTest(unittest.TestCase):
     def test_a_full_run_ruffs_the_tree_in_several_invocations(self) -> None:
         steps = RecordingSteps()
         cfg = fake_config(self.root, quality=None)
-        with patch("devloop.cli._argv_budget", return_value=120):
+        prefix = [sys.executable, "-m", "ruff", "check"]
+        budget = process.command_length(prefix) + 60
+        with patch("devloop.cli._argv_budget", return_value=budget):
             cli._static_steps(cfg, steps, [], full=True)
         ruff = [command for label, command in steps.commands if label == "ruff"]
         self.assertGreater(len(ruff), 1)
         for command in ruff:
-            self.assertLessEqual(process.command_length(command), 120)
-        self.assertEqual([part for command in ruff for part in command[4:]], self.paths)
+            self.assertLessEqual(process.command_length(command), budget)
+        self.assertEqual([part for command in ruff for part in command[len(prefix) :]], self.paths)
 
     def test_batches_are_merged_behind_one_report(self) -> None:
         cfg = fake_config(self.root)
@@ -650,24 +653,29 @@ class CommandLineLimitTest(unittest.TestCase):
     def test_baseline_collection_merges_every_ruff_batch(self) -> None:
         cfg = fake_config(self.root, quality=None)
         steps = cli.Steps(cfg, keep_going=True)
+        prefix = [
+            *cli._python(cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero")
+        ]
+        budget = process.command_length(prefix) + 60
 
         def fake_run(command, *, cwd, env=None):
             if "-m" in command and "ruff" in command and "check" in command:
-                name = Path(command[-1]).name
                 payload = [
                     {
                         "code": "E501",
-                        "filename": f"pkg/{name}",
+                        "filename": part,
                         "location": {"row": 1},
                         "message": "long",
                     }
+                    for part in command
+                    if part.startswith("pkg/")
                 ]
                 return process.Result(0, json.dumps(payload), "")
             return process.Result(0, "", "")
 
         with (
             patch("devloop.cli.process.run", side_effect=fake_run),
-            patch("devloop.cli._argv_budget", return_value=120),
+            patch("devloop.cli._argv_budget", return_value=budget),
             redirect_stdout(StringIO()),
         ):
             observed = cli._collect_findings(cfg, steps)

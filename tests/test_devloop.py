@@ -11,7 +11,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -65,6 +65,7 @@ def fake_args(**overrides) -> argparse.Namespace:
         "last_failed": False,
         "no_cache": False,
         "keep_going": False,
+        "tests_only": False,
         "explain": False,
         "changed_only": False,
         "check": False,
@@ -435,6 +436,8 @@ class RecordingSteps:
         self,
         outputs: dict[str, str] | None = None,
         reported: dict[str, list[findings.Finding]] | None = None,
+        *,
+        keep_going: bool = False,
     ) -> None:
         self.commands: list[tuple[str, list[str]]] = []
         self.failures: list[str] = []
@@ -443,6 +446,11 @@ class RecordingSteps:
         self.reported = dict(reported or {})
         self.verdicts: dict[str, bool] = {}
         self.ran: set[str] = set()
+        self.keep_going = keep_going
+
+    @property
+    def stopped(self) -> bool:
+        return bool(self.failures) and not self.keep_going
 
     def run(self, label: str, command: list[str] | None, *, defer_status: bool = False) -> bool:
         self.ran.add(label)
@@ -1365,6 +1373,91 @@ class MypyConfigWireTest(unittest.TestCase):
     def test_a_full_run_ignores_it_and_checks_the_scope(self) -> None:
         steps = self._steps(fake_args(full=True))
         self.assertEqual(dict(steps.commands)["mypy"][-1], "pkg")
+
+
+class TestsOnlyTest(unittest.TestCase):
+    """``--tests-only`` is the red/green loop: no static step, only the tests."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+        self.cfg = fake_config(self.root)
+
+    def _run(self, args: argparse.Namespace) -> tuple[int, Mock, Mock, str]:
+        static = Mock()
+        test = Mock()
+        output = StringIO()
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch(
+                "devloop.cli.gitinfo.collect",
+                return_value=[Change("pkg/module.py", " M")],
+            ),
+            patch("devloop.cli._static_steps", static),
+            patch("devloop.cli._test_step", test),
+            patch("devloop.cli.Steps", return_value=RecordingSteps()),
+            redirect_stdout(output),
+        ):
+            code = cli.run_check(args)
+        return code, static, test, output.getvalue()
+
+    def test_no_static_step_runs(self) -> None:
+        code, static, test, _ = self._run(fake_args(tests_only=True, files=["tests/test_a.py"]))
+        self.assertEqual(code, 0)
+        static.assert_not_called()
+        test.assert_called_once()
+
+    def test_the_header_says_the_run_gates_nothing(self) -> None:
+        _, _, _, output = self._run(fake_args(tests_only=True))
+        self.assertIn("[verify] 1 changed, 1 Python file(s) (tests only)", output)
+
+    def test_a_full_tests_only_run_does_not_touch_the_verdict_cache(self) -> None:
+        with (
+            patch("devloop.cli.verdict.tree_key", return_value="key") as tree_key,
+            patch("devloop.cli.verdict.recent", return_value=True) as recent,
+        ):
+            code, _, test, output = self._run(fake_args(full=True, tests_only=True))
+        self.assertEqual(code, 0)
+        tree_key.assert_not_called()
+        recent.assert_not_called()
+        test.assert_called_once()
+        self.assertNotIn("already passed", output)
+
+    def test_it_contradicts_no_tests(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--tests-only and --no-tests"):
+            self._run(fake_args(tests_only=True, no_tests=True))
+
+
+class StaticFailureHintTest(unittest.TestCase):
+    """A stopped run says how to get the test signal anyway."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        self.cfg = fake_config(self.root)
+
+    def test_the_stopped_run_names_both_flags(self) -> None:
+        steps = RecordingSteps()
+        steps.failures.append("format")
+        output = StringIO()
+        with redirect_stdout(output):
+            cli._test_step(self.cfg, steps, [], fake_args(files=["tests/test_a.py"]))
+        printed = output.getvalue()
+        self.assertIn("[verify] tests: not run, a static step failed", printed)
+        self.assertIn("--keep-going", printed)
+        self.assertIn("--tests-only", printed)
+        self.assertEqual(steps.commands, [])
+
+    def test_keep_going_runs_the_tests_after_the_failure(self) -> None:
+        steps = RecordingSteps(keep_going=True)
+        steps.failures.append("format")
+        with redirect_stdout(StringIO()):
+            cli._test_step(self.cfg, steps, [], fake_args(files=["tests/test_a.py"]))
+        self.assertIn("tests", dict(steps.commands))
 
 
 class StaleFindingsTest(unittest.TestCase):

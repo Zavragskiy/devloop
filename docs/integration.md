@@ -364,6 +364,31 @@ comparison. Static selection is conservative but cannot identify every dynamic
 import, so a full run remains necessary before merging. The verdict cache also
 makes it cheap: an unchanged tree answers in about a second.
 
+### A red static step and the test you just wrote
+
+The static steps are sequential and the first failure stops the run, so a file
+that is not formatted yet hides the test result you wanted:
+
+```text
+$ devloop check --files tests/ui/test_probe_fail.py
+[verify] format ... Would reformat: tests\ui\test_probe_fail.py
+[verify] format: FAILED (0.1s)
+[verify] tests: not run, a static step failed
+[verify] --keep-going runs them anyway; --tests-only skips the static steps
+```
+
+Two flags escape that, and they mean different things:
+
+- `--tests-only --files <paths>` is the red/green loop: no ruff, format, quality,
+  policy or mypy at all, just the selection through the configured runner. Use it
+  while the file is half-written; it proves nothing about the gates;
+- `--keep-going --files <paths>` runs the whole pipeline and reports every
+  failure, the tests included, so the gate result and the test result arrive in
+  one run. `--keep-going --full` is the same for the commit gate.
+
+Do not read `--tests-only` as a way to pass the gate: it gates nothing, and a
+green `--tests-only` run is never remembered by the verdict cache.
+
 ## Migrating from an in-repo copy
 
 A project that previously vendored the pipeline (for example `tools/devloop/`)

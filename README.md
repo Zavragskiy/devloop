@@ -79,6 +79,7 @@ From the consuming project's root, in its own environment:
 | `devloop check --explain` | the same, printing the selected test files |
 | `devloop check --full` | every tracked file and the whole suite (commit / stage gate) |
 | `devloop check --files <paths>` | gate the change, run only these test files |
+| `devloop check --tests-only --files <paths>` | run only those tests, no static step |
 | `devloop check --only <token>` | gate the change, run only matching test files |
 | `devloop check --last-failed` | gate the change, replay the last run's failures |
 | `devloop check --base origin/main` | a branch diff instead of the working tree |
@@ -91,8 +92,9 @@ From the consuming project's root, in its own environment:
 
 `check` is the default command, so `devloop` alone works. `--jobs N` forwards
 shard parallelism, `--no-tests` skips the test step, `--keep-going` reports every
-failing step instead of stopping at the first, `--no-cache` ignores a recorded
-green verdict.
+failing step and still runs the tests when a static step failed, `--tests-only`
+skips the static steps and runs only the selected tests, `--no-cache` ignores a
+recorded green verdict.
 
 ### Two loops, one command
 

@@ -394,6 +394,10 @@ def _test_step(
     if command is None:
         print("[verify] tests: skipped")
         return
+    if steps.stopped:
+        print("[verify] tests: not run, a static step failed")
+        print("[verify] --keep-going runs them anyway; --tests-only skips the static steps")
+        return
     if not steps.run("tests", command):
         report.test_failures(cfg)
 
@@ -495,7 +499,13 @@ def _finish(steps: Steps) -> int:
 
 def _cache_key(cfg: Config, args: argparse.Namespace) -> str | None:
     """The tree key when this run may be replayed from the cache, else ``None``."""
-    cacheable = args.full and not args.base and not args.no_cache and not args.no_tests
+    cacheable = (
+        args.full
+        and not args.base
+        and not args.no_cache
+        and not args.no_tests
+        and not args.tests_only
+    )
     if not cacheable or _explicit_selection(args):
         return None
     return verdict.tree_key(cfg)
@@ -510,9 +520,12 @@ def _baseline_entries(cfg: Config) -> dict[str, set[str]] | None:
 
 def run_check(args: argparse.Namespace) -> int:
     cfg = config.load()
+    if args.tests_only and args.no_tests:
+        raise ValueError("--tests-only and --no-tests contradict each other")
     changes = gitinfo.collect(cfg.root, args.base)
     files = _changed_python(cfg, changes)
-    scope = " (full)" if args.full else ""
+    markers = [name for name, on in (("full", args.full), ("tests only", args.tests_only)) if on]
+    scope = f" ({', '.join(markers)})" if markers else ""
     print(f"[verify] {_changed_count(changes)} changed, {len(files)} Python file(s){scope}")
 
     key = _cache_key(cfg, args)
@@ -522,14 +535,15 @@ def run_check(args: argparse.Namespace) -> int:
     entries = _baseline_entries(cfg)
     quiet = frozenset({"ruff", "format", "mypy"}) if entries is not None else frozenset()
     steps = Steps(cfg, args.keep_going, quiet=quiet)
-    _static_steps(
-        cfg,
-        steps,
-        files,
-        args.full,
-        entries=entries,
-        changed_only=args.changed_only or cfg.mypy_changed_only,
-    )
+    if not args.tests_only:
+        _static_steps(
+            cfg,
+            steps,
+            files,
+            args.full,
+            entries=entries,
+            changed_only=args.changed_only or cfg.mypy_changed_only,
+        )
     _test_step(cfg, steps, changes, args)
     code = _finish(steps)
     if code == 0 and key is not None:
@@ -694,6 +708,12 @@ stage, not after every edit. A green --full run is remembered for the exact
 tree it gated, so repeating it on an unchanged tree answers in about a second;
 --no-cache ignores that record.
 
+The static steps stop the run when one of them fails, and the tests are then
+not run either; --keep-going reports every failing step instead and still runs
+them, while --tests-only skips the static steps altogether and runs only the
+selected tests. --tests-only is the red/green loop on a file that is not
+formatted yet; --keep-going --full is the commit gate that keeps going.
+
 A baseline file (devloop-baseline.json unless configured otherwise) freezes the
 findings a tree already has: check fails only on new ones, and --full names the
 entries that no longer match. devloop baseline rewrites it from the whole tree;
@@ -769,7 +789,16 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
         help="ignore a recorded green verdict for this tree",
     )
     parser.add_argument(
-        "--keep-going", action="store_true", help="do not stop on the first failure"
+        "--keep-going",
+        action="store_true",
+        help="do not stop at the first failure: report every failing step and still run "
+        "the tests when a static step failed",
+    )
+    parser.add_argument(
+        "--tests-only",
+        action="store_true",
+        help="skip every static step (ruff, format, quality, policy, mypy) and run only "
+        "the selected tests",
     )
     parser.add_argument("--explain", action="store_true", help="print the selected test files")
     return parser

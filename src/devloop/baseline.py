@@ -26,7 +26,7 @@ VERSION = 1
 
 @dataclass(frozen=True)
 class Comparison:
-    """New findings, stale entries and how many findings matched the baseline."""
+    """New findings, stale entries and the distinct keys the baseline accepted."""
 
     new: dict[str, tuple[Finding, ...]]
     stale: dict[str, tuple[str, ...]]
@@ -92,14 +92,11 @@ def compare(
     for step in sorted(set(steps)):
         frozen = entries.get(step, set())
         fresh: dict[str, Finding] = {}
-        seen = 0
+        known += len({finding.key for finding in observed.get(step, ()) if finding.key in frozen})
         for finding in observed.get(step, []):
-            if finding.key in frozen:
-                seen += 1
-            else:
+            if finding.key not in frozen:
                 fresh.setdefault(finding.key, finding)
         new[step] = tuple(fresh.values())
-        known += seen
     stale: dict[str, tuple[str, ...]] = {}
     if full:
         for step in sorted(entries):

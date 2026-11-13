@@ -78,6 +78,7 @@ class Steps:
         self.seconds: float = 0.0
         self.outputs: dict[str, str] = {}
         self.ran: set[str] = set()
+        self.pending: dict[str, tuple[bool, float]] = {}
 
     @property
     def stopped(self) -> bool:
@@ -93,8 +94,13 @@ class Steps:
         env["DEVLOOP_FINDINGS_FILE"] = str(self.report_path(label))
         return env
 
-    def run(self, label: str, command: list[str] | None) -> bool:
-        """Run one step; True when it passed or was skipped."""
+    def run(self, label: str, command: list[str] | None, *, defer_status: bool = False) -> bool:
+        """Run one step; True when it passed or was skipped.
+
+        ``defer_status`` keeps the timing line back until :meth:`settle` knows
+        whether the baseline accepts the findings; printing ``FAILED`` first and
+        clearing it afterwards would leave a false failure in the log.
+        """
         if command is None or self.stopped:
             return True
         self.ran.add(label)
@@ -113,10 +119,14 @@ class Steps:
         self.outputs[label] = output
         if output and label not in self.quiet:
             print(output, end="" if output.endswith("\n") else "\n")
-        print(f"[verify] {label}: {'ok' if result.returncode == 0 else 'FAILED'} ({elapsed:.1f}s)")
-        if result.returncode != 0:
+        passed = result.returncode == 0
+        if defer_status:
+            self.pending[label] = (passed, elapsed)
+        else:
+            print(f"[verify] {label}: {'ok' if passed else 'FAILED'} ({elapsed:.1f}s)")
+        if not passed:
             self.failures.append(label)
-        return result.returncode == 0
+        return passed
 
     def collect(self, label: str) -> list[findings.Finding]:
         """The findings a step wrote for this run, never a previous run's file."""
@@ -130,6 +140,9 @@ class Steps:
             self.failures[:] = [failure for failure in self.failures if failure != label]
         elif label not in self.failures:
             self.failures.append(label)
+        pending = self.pending.pop(label, None)
+        if pending is not None:
+            print(f"[verify] {label}: {'ok' if ok else 'FAILED'} ({pending[1]:.1f}s)")
 
     def failure_output(self, label: str) -> str:
         """The captured output of a quiet step, for a failure that parsed nothing."""
@@ -156,7 +169,7 @@ def _settle(
     comparison = baseline.compare(entries, {label: found}, [label], full=full)
     fresh = list(comparison.new.get(label, ()))
     known_keys = entries.get(label, set())
-    known = sum(1 for finding in found if finding.key in known_keys)
+    known = len({finding.key for finding in found if finding.key in known_keys})
     if fresh:
         report.new_findings(label, fresh, known, detail=detail)
         steps.settle(label, ok=False)
@@ -172,6 +185,10 @@ def _settle(
     stale = list(comparison.stale.get(label, ()))
     if stale:
         report.stale_entries(label, stale)
+    # The timing line was held back by ``defer_status``; print it now that the
+    # baseline has decided. This is also the only settle of a step that reported
+    # no finding at all (ruff ``--exit-zero``, a clean formatter).
+    steps.settle(label, ok=label not in steps.failures)
 
 
 def _static_steps(
@@ -193,15 +210,24 @@ def _static_steps(
                 _python(
                     cfg, "-m", "ruff", "check", "--output-format", "json", "--exit-zero", *gated
                 ),
+                defer_status=True,
             )
             found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
             _settle(steps, "ruff", found, entries, full, detail=True)
-        steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *gated))
+        steps.run(
+            "format",
+            _python(cfg, "-m", "ruff", "format", "--check", *gated),
+            defer_status=entries is not None,
+        )
         if entries is not None:
             found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
             _settle(steps, "format", found, entries, full)
     if cfg.quality is not None and gated:
-        steps.run("quality", _python(cfg, str(cfg.quality), *gated))
+        steps.run(
+            "quality",
+            _python(cfg, str(cfg.quality), *gated),
+            defer_status=entries is not None,
+        )
         if entries is not None:
             _settle(steps, "quality", _collected(steps, "quality"), entries, full)
     if cfg.policy is not None:
@@ -215,7 +241,7 @@ def _static_steps(
         if command is None:
             print("[verify] mypy: skipped, no changed file inside the mypy scope")
         else:
-            steps.run("mypy", command)
+            steps.run("mypy", command, defer_status=entries is not None)
             if entries is not None:
                 found = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
                 _settle(steps, "mypy", found, entries, full, detail=True)
@@ -230,6 +256,8 @@ def _run_check(
     files: list[str],
     entries: dict[str, set[str]] | None,
     full: bool,
+    *,
+    defer_status: bool = False,
 ) -> None:
     """Run one ``[[tool.devloop.check]]`` command with the paths it asked for."""
     if spec.paths == "changed":
@@ -243,7 +271,7 @@ def _run_check(
     else:
         targets = _all_python(cfg) if spec.paths == "all" else []
     command = [*cfg.resolve_command(spec.command), *targets]
-    steps.run(spec.name, command)
+    steps.run(spec.name, command, defer_status=defer_status or entries is not None)
     if entries is not None:
         _settle(steps, spec.name, _collected(steps, spec.name), entries, full)
 
@@ -444,32 +472,44 @@ def _collect_findings(cfg: Config, steps: Steps) -> dict[str, list[findings.Find
         except ValueError as error:
             print(f"devloop: {error}", file=sys.stderr)
             return None
-        if "ruff" in steps.failures:
-            broken.append("ruff")
-        steps.run("format", _python(cfg, "-m", "ruff", "format", "--check", *targets))
+        _collect_verdict(steps, "ruff", observed["ruff"], broken)
+        steps.run(
+            "format", _python(cfg, "-m", "ruff", "format", "--check", *targets), defer_status=True
+        )
         observed["format"] = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
-        if "format" in steps.failures and not observed["format"]:
-            broken.append("format")
+        _collect_verdict(steps, "format", observed["format"], broken)
         command = _mypy_command(cfg, targets, changed_only=False, baseline_mode=True)
         if command is not None:
-            steps.run("mypy", command)
+            steps.run("mypy", command, defer_status=True)
             observed["mypy"] = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
-            if "mypy" in steps.failures and not observed["mypy"]:
-                broken.append("mypy")
+            _collect_verdict(steps, "mypy", observed["mypy"], broken)
     if cfg.quality is not None and targets:
-        steps.run("quality", _python(cfg, str(cfg.quality), *targets))
+        steps.run("quality", _python(cfg, str(cfg.quality), *targets), defer_status=True)
         observed["quality"] = _collected(steps, "quality")
-        if "quality" in steps.failures and not observed["quality"]:
-            broken.append("quality")
+        _collect_verdict(steps, "quality", observed["quality"], broken)
     for spec in cfg.checks:
-        _run_check(cfg, steps, spec, targets, None, True)
+        _run_check(cfg, steps, spec, targets, None, True, defer_status=True)
         observed[spec.name] = _collected(steps, spec.name)
-        if spec.name in steps.failures and not observed[spec.name]:
-            broken.append(spec.name)
+        _collect_verdict(steps, spec.name, observed[spec.name], broken)
     if broken:
         print(f"devloop: {', '.join(broken)} failed without a finding", file=sys.stderr)
         return None
     return observed
+
+
+def _collect_verdict(
+    steps: Steps, label: str, found: list[findings.Finding], broken: list[str]
+) -> None:
+    """Settle a collection step: findings are the point, a silent crash is not.
+
+    ``Steps.run`` held its status line back, so this prints it: ``ok`` when the
+    tool reported the findings it was asked for (its exit code is not a verdict
+    while collecting), ``FAILED`` when it broke without parsing to anything.
+    """
+    crashed = label in steps.failures and not found
+    if crashed:
+        broken.append(label)
+    steps.settle(label, ok=not crashed)
 
 
 def _check_baseline(cfg: Config, observed: dict[str, list[findings.Finding]]) -> int:
@@ -482,7 +522,8 @@ def _check_baseline(cfg: Config, observed: dict[str, list[findings.Finding]]) ->
     dirty = False
     for step in sorted({*observed, *entries}):
         found = observed.get(step, [])
-        known = sum(1 for finding in found if finding.key in entries.get(step, set()))
+        known_keys = entries.get(step, set())
+        known = len({finding.key for finding in found if finding.key in known_keys})
         fresh = list(comparison.new.get(step, ()))
         stale = list(comparison.stale.get(step, ()))
         if fresh:
@@ -493,7 +534,8 @@ def _check_baseline(cfg: Config, observed: dict[str, list[findings.Finding]]) ->
             dirty = True
     if dirty:
         return 1
-    print(f"[verify] baseline is current ({sum(len(keys) for keys in entries.values())} entries)")
+    total = sum(len(keys) for keys in entries.values())
+    print(f"[verify] baseline is current ({total} {'entry' if total == 1 else 'entries'})")
     return 0
 
 
@@ -515,7 +557,7 @@ def run_baseline(args: argparse.Namespace) -> int:
         cfg.baseline, {step: [found.key for found in items] for step, items in observed.items()}
     )
     for step in sorted(observed):
-        print(f"[verify] {step}: {len(observed[step])} finding(s)")
+        print(f"[verify] {step}: {len({finding.key for finding in observed[step]})} finding(s)")
     print(f"[verify] baseline written to {cfg.baseline}")
     return 0
 

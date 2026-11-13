@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -444,7 +444,7 @@ class RecordingSteps:
         self.verdicts: dict[str, bool] = {}
         self.ran: set[str] = set()
 
-    def run(self, label: str, command: list[str] | None) -> bool:
+    def run(self, label: str, command: list[str] | None, *, defer_status: bool = False) -> bool:
         self.ran.add(label)
         self.commands.append((label, command or []))
         return True
@@ -774,6 +774,17 @@ class BaselineCompareTest(unittest.TestCase):
         self.assertFalse(result.has_new)
         self.assertEqual(result.known, 1)
 
+    def test_two_occurrences_of_one_key_are_counted_once(self) -> None:
+        finding = self._find("quality", "a.py:DUPE")
+        result = baseline.compare(
+            {"quality": {"a.py:DUPE"}},
+            {"quality": [finding, finding]},
+            ["quality"],
+            full=False,
+        )
+        self.assertFalse(result.has_new)
+        self.assertEqual(result.known, 1)
+
     def test_stale_entries_are_reported_only_on_a_full_run(self) -> None:
         narrow = baseline.compare({"ruff": {"a.py:E501"}}, {}, ["ruff"], full=False)
         self.assertEqual(narrow.stale, {})
@@ -832,6 +843,56 @@ class BaselineStepTest(unittest.TestCase):
         )
         self.assertTrue(steps.verdicts["quality"])
         self.assertNotIn("quality", steps.failures)
+
+    def test_a_fully_baselined_step_is_printed_as_ok(self) -> None:
+        cfg = fake_config(self.root, quality=self.root / "quality.py")
+
+        def fake_run(command, cwd=None, env=None):
+            if str(cfg.quality) in command:
+                report = Path(env["DEVLOOP_FINDINGS_FILE"])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text('{"key": "dupe-main@pkg/module.py"}\n', encoding="utf-8")
+                return subprocess.CompletedProcess(command, 1, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        steps = cli.Steps(cfg, keep_going=False)
+        output = StringIO()
+        with (
+            patch.object(cli.process, "run", side_effect=fake_run),
+            redirect_stdout(output),
+        ):
+            cli._static_steps(
+                cfg,
+                steps,
+                ["pkg/module.py"],
+                full=False,
+                entries={"quality": {"dupe-main@pkg/module.py"}},
+            )
+        text = output.getvalue()
+        self.assertNotIn("FAILED", text)
+        self.assertIn("quality: ok", text)
+        self.assertIn("0 new findings, 1 baselined", text)
+
+
+class DeferredStatusTest(unittest.TestCase):
+    """A step reconciled with the baseline must not print FAILED."""
+
+    def test_a_baselined_step_is_printed_after_settle(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            steps = cli.Steps(fake_config(root), keep_going=False)
+            result = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+            output = StringIO()
+            with patch.object(cli.process, "run", return_value=result):
+                with redirect_stdout(output):
+                    steps.run("quality", ["quality"], defer_status=True)
+            self.assertNotIn("FAILED", output.getvalue())
+
+            settled = StringIO()
+            with redirect_stdout(settled):
+                steps.settle("quality", ok=True)
+            self.assertIn("quality: ok", settled.getvalue())
+            self.assertNotIn("FAILED", settled.getvalue())
 
 
 class MypyScopeTest(unittest.TestCase):
@@ -953,7 +1014,7 @@ class ScriptedSteps(cli.Steps):
         self.reported = dict(type(self).reported)
         self.failing = set(type(self).failing)
 
-    def run(self, label: str, command: list[str] | None) -> bool:
+    def run(self, label: str, command: list[str] | None, *, defer_status: bool = False) -> bool:
         self.ran.add(label)
         self.outputs[label] = self.ruff_output if label == "ruff" else ""
         if label in self.failing:
@@ -993,7 +1054,9 @@ class BaselineCommandTest(unittest.TestCase):
 
     def test_a_failing_tool_writes_nothing(self) -> None:
         class Broken(ScriptedSteps):
-            def run(self, label: str, command: list[str] | None) -> bool:
+            def run(
+                self, label: str, command: list[str] | None, *, defer_status: bool = False
+            ) -> bool:
                 self.failures.append(label)
                 self.outputs[label] = "traceback"
                 return False
@@ -1005,6 +1068,87 @@ class BaselineCommandTest(unittest.TestCase):
         ):
             self.assertEqual(cli.run_baseline(self.args), 2)
         self.assertFalse(self.path.exists())
+
+    def test_the_per_step_summary_counts_entries_not_occurrences(self) -> None:
+        finding = findings.Finding("quality", "dupe-main@pkg/module.py", "dupe-main")
+        ScriptedSteps.ruff_output = "[]"
+        ScriptedSteps.reported = {"quality": [finding, finding]}
+        self.addCleanup(setattr, ScriptedSteps, "reported", {})
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(self._run(), 0)
+        self.assertIn("quality: 1 finding(s)", output.getvalue())
+        self.assertEqual(baseline.load(self.path), {"quality": {"dupe-main@pkg/module.py"}})
+
+
+class CollectionModeTest(unittest.TestCase):
+    """``devloop baseline`` freezes findings, so a nonzero exit is expected."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        self.cfg = fake_config(self.root, quality=self.root / "quality.py")
+
+    def _collect(self, report: bool) -> tuple[dict[str, list[findings.Finding]] | None, str]:
+        steps = cli.Steps(self.cfg, keep_going=True, quiet=frozenset({"ruff", "format", "mypy"}))
+
+        def fake_run(command, cwd=None, env=None):
+            if str(self.cfg.quality) in command:
+                if report:
+                    path = Path(env["DEVLOOP_FINDINGS_FILE"])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('{"key": "dupe-main@pkg/module.py"}\n', encoding="utf-8")
+                return subprocess.CompletedProcess(command, 1, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        output = StringIO()
+        errors = StringIO()
+        with (
+            patch.object(cli.process, "run", side_effect=fake_run),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            observed = cli._collect_findings(self.cfg, steps)
+        return observed, output.getvalue() + errors.getvalue()
+
+    def test_a_finding_written_for_the_baseline_is_not_printed_as_failed(self) -> None:
+        observed, text = self._collect(report=True)
+        self.assertIsNotNone(observed)
+        assert observed is not None
+        self.assertEqual(
+            [finding.key for finding in observed["quality"]], ["dupe-main@pkg/module.py"]
+        )
+        self.assertNotIn("FAILED", text)
+        self.assertIn("quality: ok", text)
+
+    def test_a_tool_that_crashes_without_a_finding_still_fails(self) -> None:
+        observed, text = self._collect(report=False)
+        self.assertIsNone(observed)
+        self.assertIn("quality: FAILED", text)
+        self.assertIn("quality failed without a finding", text)
+
+
+class BaselineCurrentTest(unittest.TestCase):
+    """``devloop baseline --check`` says how much of the baseline is current."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        self.path = self.root / "devloop-baseline.json"
+        baseline.save(self.path, {"quality": {"dupe-main@pkg/module.py"}})
+        self.cfg = fake_config(self.root, baseline=self.path)
+
+    def test_a_single_entry_is_named_in_the_singular(self) -> None:
+        found = [findings.Finding("quality", "dupe-main@pkg/module.py", "dupe-main")]
+        output = StringIO()
+        with redirect_stdout(output):
+            code = cli._check_baseline(self.cfg, {"quality": found})
+        self.assertEqual(code, 0)
+        self.assertIn("baseline is current (1 entry)", output.getvalue())
 
 
 class RunnerExampleTest(unittest.TestCase):

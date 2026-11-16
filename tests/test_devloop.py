@@ -798,6 +798,91 @@ class DirectPytestTest(unittest.TestCase):
         self.assertNotIn("--jobs", cli._test_command(self.cfg, [], args))
 
 
+class ExplicitFilesCheckTest(unittest.TestCase):
+    """An explicit ``--files`` list is checked before anything runs."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "tests/test_app_smoke.py", "")
+        write(self.root, "tests/ui/test_a.py", "")
+        write(self.root, "tests/ui/test_b.py", "")
+        write(self.root, "tests/ui/helpers.py", "")
+        write(self.root, "tests/domains/tool/notes.txt", "")
+        self.cfg = fake_config(self.root)
+
+    def test_existing_python_files_pass(self) -> None:
+        absolute = str(self.root / "tests/test_app_smoke.py")
+        cli._checked_files(self.cfg, ["tests/ui/test_a.py", absolute])
+
+    def test_a_missing_file_is_named_with_a_suggestion(self) -> None:
+        pattern = (
+            r"tests/ui/test_app_smoke\.py: no such file; "
+            r"did you mean tests/test_app_smoke\.py"
+        )
+        with self.assertRaisesRegex(ValueError, pattern):
+            cli._checked_files(self.cfg, ["tests/ui/test_app_smoke.py"])
+
+    def test_a_directory_names_the_test_files_it_holds(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"tests/ui: is a directory, not a test file; "
+            r"it holds test files: tests/ui/test_a\.py, tests/ui/test_b\.py",
+        ):
+            cli._checked_files(self.cfg, ["tests/ui"])
+
+    def test_a_directory_without_tests_says_so(self) -> None:
+        with self.assertRaisesRegex(ValueError, "it holds no test file"):
+            cli._checked_files(self.cfg, ["tests/domains/tool"])
+
+    def test_a_typo_far_from_every_test_stays_quiet(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"tests/nothing\.py: no such file$") as caught:
+            cli._checked_files(self.cfg, ["tests/nothing.py"])
+        self.assertNotIn("did you mean", str(caught.exception))
+
+    def test_a_typo_in_the_file_name_is_suggested(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"did you mean tests/ui/test_a\.py$"):
+            cli._checked_files(self.cfg, ["tests/ui/test_aa.py"])
+
+    def test_a_non_python_file_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "notes.txt: not a Python file"):
+            cli._checked_files(self.cfg, ["tests/domains/tool/notes.txt"])
+
+    def test_every_bad_path_is_reported_in_one_error(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            cli._checked_files(self.cfg, ["tests/ui", "nowhere.py", "tests/ui/test_a.py"])
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("--files must name existing test files:"))
+        self.assertIn("tests/ui: is a directory", message)
+        self.assertIn("nowhere.py: no such file", message)
+        self.assertNotIn("tests/ui/test_a.py:", message)
+
+    def test_run_check_fails_before_the_static_steps(self) -> None:
+        static = Mock()
+        steps = Mock()
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.gitinfo.collect", return_value=[]),
+            patch("devloop.cli._static_steps", static),
+            patch("devloop.cli.Steps", steps),
+            redirect_stdout(StringIO()),
+        ):
+            with self.assertRaisesRegex(ValueError, "--files must name existing test files"):
+                cli.run_check(fake_args(files=["tests/nowhere.py"]))
+        static.assert_not_called()
+        steps.assert_not_called()
+
+    def test_no_tests_leaves_the_list_alone(self) -> None:
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.gitinfo.collect", return_value=[]),
+            patch("devloop.cli.Steps", return_value=RecordingSteps()),
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(cli.run_check(fake_args(no_tests=True, files=["tests/nowhere.py"])), 0)
+
+
 class GitOutputTest(unittest.TestCase):
     def test_output_is_empty_when_git_fails(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

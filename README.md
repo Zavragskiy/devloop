@@ -96,6 +96,11 @@ failing step and still runs the tests when a static step failed, `--tests-only`
 skips the static steps and runs only the selected tests, `--no-cache` ignores a
 recorded green verdict.
 
+`--files` is a promise, so it is checked before the run: every path must be an
+existing Python file. A directory or a typo stops the run and names the test
+files the path probably meant, instead of ending with a green `tests: ok` where
+nothing was selected.
+
 ### Two loops, one command
 
 The default changed mode is the edit loop: it gates the files you touched and

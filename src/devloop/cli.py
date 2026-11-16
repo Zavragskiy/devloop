@@ -12,6 +12,7 @@ default.
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import sys
 import time
@@ -407,6 +408,77 @@ def _explicit_selection(args: argparse.Namespace) -> bool:
     return bool(args.files or args.only or args.last_failed)
 
 
+def _checked_files(cfg: Config, paths: list[str]) -> None:
+    """Refuse an explicit ``--files`` list that cannot name test files.
+
+    The paths reach the runner verbatim, so a directory or a typo arrives there
+    unchanged. A runner that skips what it does not recognise then warns on its
+    own output and the run still reports ``tests: ok`` with nothing selected, so
+    the selection is checked here: each path must exist and be a Python file.
+    The check runs before the static steps, so the run fails fast instead of
+    spending a minute on ruff and mypy before the tests select nothing.
+    """
+    problems = [text for raw in paths if (text := _file_problem(cfg, raw)) is not None]
+    if problems:
+        raise ValueError("--files must name existing test files:\n" + "\n".join(problems))
+
+
+def _file_problem(cfg: Config, raw: str) -> str | None:
+    """The reason ``raw`` cannot be a test file, or ``None`` when it can."""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = cfg.root / path
+    if not path.exists():
+        return f"  {raw}: no such file{_near_test(cfg, raw)}"
+    if path.is_dir():
+        return f"  {raw}: is a directory, not a test file{_inside(path, cfg)}"
+    if path.suffix != ".py":
+        return f"  {raw}: not a Python file"
+    return None
+
+
+def _inside(path: Path, cfg: Config) -> str:
+    """A hint naming the test files a directory holds."""
+    found = sorted(
+        child
+        for child in path.rglob("*.py")
+        if child.name.startswith("test_") or child.name.endswith("_test.py")
+    )
+    if not found:
+        return "; it holds no test file"
+    shown = ", ".join(_relative(cfg, child) for child in found[:3])
+    rest = "" if len(found) <= 3 else f" (and {len(found) - 3} more)"
+    return f"; it holds test files: {shown}{rest}"
+
+
+def _relative(cfg: Config, path: Path) -> str:
+    """``path`` from the project root, even when it lies outside it."""
+    try:
+        return cfg.relative(path)
+    except ValueError:
+        return path.as_posix()
+
+
+def _near_test(cfg: Config, raw: str) -> str:
+    """``; did you mean …`` for a path that looks like a typo of a test file.
+
+    A test file with the same name elsewhere is a likely intended target; after
+    that, close names and then close paths are tried, both with a high cutoff so
+    an unrelated test is never offered as the fix.
+    """
+    candidates = impact.all_tests(cfg)
+    name = Path(raw).name
+    same = [path for path in candidates if Path(path).name == name]
+    if same:
+        return f"; did you mean {same[0]}"
+    by_name = {Path(path).name: path for path in candidates}
+    close = difflib.get_close_matches(name, list(by_name), n=1, cutoff=0.8)
+    if close:
+        return f"; did you mean {by_name[close[0]]}"
+    near = difflib.get_close_matches(raw.replace("\\", "/"), candidates, n=1, cutoff=0.85)
+    return f"; did you mean {near[0]}" if near else ""
+
+
 @dataclass(frozen=True)
 class Request:
     """What the test step should run, stated without the runner's flags."""
@@ -522,6 +594,8 @@ def run_check(args: argparse.Namespace) -> int:
     cfg = config.load()
     if args.tests_only and args.no_tests:
         raise ValueError("--tests-only and --no-tests contradict each other")
+    if args.files and not args.no_tests:
+        _checked_files(cfg, args.files)
     changes = gitinfo.collect(cfg.root, args.base)
     files = _changed_python(cfg, changes)
     markers = [name for name, on in (("full", args.full), ("tests only", args.tests_only)) if on]
@@ -769,7 +843,8 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
         nargs="+",
         default=[],
         metavar="PATH",
-        help="run only these test files (implies an explicit selection)",
+        help="run only these test files (implies an explicit selection); each path must be "
+        "an existing test file, checked before the run",
     )
     parser.add_argument(
         "--only",

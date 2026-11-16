@@ -144,6 +144,20 @@ same request onto pytest: the selected files become positional arguments,
 none matches, never a surprise full run), `--last-failed` becomes pytest's own
 `--lf`, and `--jobs` is ignored because it only applies to a sharding runner.
 
+An explicit selection (`--files`) is checked before the run, before the static
+steps: each path must be an existing Python file. The paths go to the runner
+verbatim, so without the check a directory or a typo reaches it unchanged; a
+runner that skips what it does not recognise warns on its own output and the run
+still reports `tests: ok` with nothing selected. The check instead stops with
+exit code 2 and names every offending path, the test files a directory holds and
+the test file a typo probably meant:
+
+```text
+$ devloop check --files tests/domains/tool
+devloop: --files must name existing test files:
+  tests/domains/tool: is a directory, not a test file; it holds test files: tests/domains/tool/test_gate.py, tests/domains/tool/test_tool.py
+```
+
 Optionally the runner records its outcome so a failing run explains itself. Write
 `<cache_dir>/run-tests.json`:
 

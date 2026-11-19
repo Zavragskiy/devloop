@@ -400,7 +400,12 @@ Two flags escape that, and they mean different things:
   while the file is half-written; it proves nothing about the gates;
 - `--keep-going --files <paths>` runs the whole pipeline and reports every
   failure, the tests included, so the gate result and the test result arrive in
-  one run. `--keep-going --full` is the same for the commit gate.
+  one run. `--keep-going --full` is the same for the commit gate. A file that
+  does not parse is the exception once ruff findings are parsed, which is every
+  project with a baseline and every draft run: the formatter skips that file and
+  the tests are not run (`tests: not run, a file does not parse`), because the
+  suite cannot import the module. Under 0.3.8 `--keep-going` still ran those
+  tests. A strict run without a baseline still does.
 
 Do not read `--tests-only` as a way to pass the gate: it gates nothing, and a
 green `--tests-only` run is never remembered by the verdict cache.
@@ -418,10 +423,10 @@ poetry run devloop mode default   # drop the pin
 poetry run devloop check --mode draft   # one run, without a pin
 ```
 
-A draft `check` runs every step, so nothing is skipped: draft implies
-`--keep-going`, and a blocking finding fails the run without hiding the later
-steps or the tests. A new finding fails the run only when it means the code is
-broken:
+A draft `check` runs every step except what cannot parse. Draft implies
+`--keep-going`, so any other blocking finding fails the run without hiding the
+later steps or the tests. A new finding fails the run only when it means the
+code is broken:
 
 - a file that does not parse (ruff `invalid-syntax`): always blocks. The formatter
   is not asked to check it, because `ruff format` then fails without a finding

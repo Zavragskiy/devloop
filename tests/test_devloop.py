@@ -1862,7 +1862,11 @@ class DraftPipelineTest(unittest.TestCase):
         def run(command, cwd=None, env=None):
             if command[1:4] == ["-m", "ruff", "check"]:
                 self.ran.append("ruff")
-                return subprocess.CompletedProcess(command, 0, scenario.get("ruff", "[]"), "")
+                # The parsed invocation passes --exit-zero; a plain strict run
+                # does not, so its exit code can still fail the step.
+                parsed = "--exit-zero" in command
+                code = 0 if parsed else int(scenario.get("ruff_exit", 0))
+                return subprocess.CompletedProcess(command, code, scenario.get("ruff", "[]"), "")
             if command[1:4] == ["-m", "ruff", "format"]:
                 self.ran.append("format")
                 text = "Would reformat: pkg/module.py\n" if scenario.get("unformatted") else ""
@@ -1964,6 +1968,30 @@ class DraftPipelineTest(unittest.TestCase):
         lines = text.rstrip().splitlines()
         self.assertTrue(lines[-2].startswith("[verify] FAILED (draft; also deferred: 1 finding"))
         self.assertEqual(lines[-1], "[verify] failed: tests")
+
+    def test_strict_with_a_baseline_skips_tests_on_a_syntax_error(self) -> None:
+        path = self.root / "devloop-baseline.json"
+        baseline.save(path, {})
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py", baseline=path)
+        code, text = self._check(
+            fake_args(files=["tests/test_a.py"], keep_going=True),
+            ruff=ruff_json("invalid-syntax"),
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("mode:", text)
+        self.assertNotIn("tests", self.ran)
+        self.assertIn("[verify] tests: not run, a file does not parse", text)
+        self.assertNotIn("a static step failed", text)
+
+    def test_strict_without_a_baseline_still_runs_the_tests(self) -> None:
+        code, text = self._check(
+            fake_args(files=["tests/test_a.py"], keep_going=True),
+            ruff=ruff_json("invalid-syntax"),
+            ruff_exit=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("tests", self.ran)
+        self.assertNotIn("a file does not parse", text)
 
     def test_a_syntax_error_blocks_and_skips_what_cannot_parse(self) -> None:
         code, text = self._check(self._draft(), ruff=ruff_json("invalid-syntax"))

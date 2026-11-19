@@ -1009,9 +1009,12 @@ tree it gated, so repeating it on an unchanged tree answers in about a second;
 
 The static steps stop the run when one of them fails, and the tests are then
 not run either; --keep-going reports every failing step instead and still runs
-them, while --tests-only skips the static steps altogether and runs only the
-selected tests. --tests-only is the red/green loop on a file that is not
-formatted yet; --keep-going --full is the commit gate that keeps going.
+them. A file that does not parse is the exception once ruff findings are parsed
+(a baseline, or draft): its formatting is skipped and the tests are not run,
+because the suite cannot import it. --tests-only skips the static steps
+altogether and runs only the selected tests. --tests-only is the red/green loop
+on a file that is not formatted yet; --keep-going --full is the commit gate
+that keeps going.
 
 A baseline file (devloop-baseline.json unless configured otherwise) freezes the
 findings a tree already has: check fails only on new ones, and --full names the
@@ -1020,14 +1023,13 @@ devloop baseline --check fails when a new finding or a stale entry appears, so
 CI can keep the accepted debt from rotting.
 
 Draft mode is for prototyping: devloop mode draft pins it for this checkout,
---mode draft sets it for one run. A plain check runs every step (draft implies
---keep-going) but fails
-only on a file that does not parse (its formatting and tests are skipped), a tool
-that breaks without a finding and
-what [tool.devloop.modes] draft_blocking lists (undefined names and the affected
-tests by default); everything else is counted on the last line as deferred and
-blocks at --full, which is always strict. --show-deferred prints the deferred
-detail; --explain stays the test selection. devloop mode default drops the pin.
+--mode draft sets it for one run. A plain check runs every step except what
+cannot parse (draft implies --keep-going) and fails only on a file that does
+not parse, a tool that breaks without a finding and what [tool.devloop.modes]
+draft_blocking lists (undefined names and the affected tests by default);
+everything else is counted on the last line as deferred and blocks at --full,
+which is always strict. --show-deferred prints the deferred detail; --explain
+stays the test selection. devloop mode default drops the pin.
 """
 
 DESCRIPTION = """\

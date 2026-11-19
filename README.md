@@ -96,7 +96,10 @@ From the consuming project's root, in its own environment:
 shard parallelism, `--no-tests` skips the test step, `--keep-going` reports every
 failing step and still runs the tests when a static step failed, `--tests-only`
 skips the static steps and runs only the selected tests, `--no-cache` ignores a
-recorded green verdict.
+recorded green verdict. Once ruff findings are parsed (a baseline file, or draft
+mode), a file that does not parse is left out of the formatter and its tests are
+not run, `--keep-going` included: the suite cannot import the module. A strict
+run without a baseline still runs them.
 
 `--files` is a promise, so it is checked before the run: every path must be an
 existing Python file. A directory or a typo stops the run and names the test
@@ -114,8 +117,9 @@ commit or at the end of a stage, not after every edit.
 
 While prototyping, every red quality or format line pulls an agent into
 polishing code that will change in the next turn. In draft mode (`devloop mode
-draft`) the edit loop still runs every step but fails only on what breaks the
-code: a file that does not parse, a tool that crashes, undefined names and the
+draft`) the edit loop runs every step except what cannot parse, and fails only
+on what breaks the code: a file that does not parse, a tool that crashes,
+undefined names and the
 affected tests. Everything else is counted on the last line, `ok (draft;
 deferred: ...)`, and blocks at `--full`, which is always strict. The commit gate
 then reports it all in one pass. See

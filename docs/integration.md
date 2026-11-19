@@ -423,7 +423,10 @@ A draft `check` runs every step, so nothing is skipped: draft implies
 steps or the tests. A new finding fails the run only when it means the code is
 broken:
 
-- a file that does not parse (ruff `invalid-syntax`): always blocks;
+- a file that does not parse (ruff `invalid-syntax`): always blocks. The formatter
+  is not asked to check it, because `ruff format` then fails without a finding
+  and reads as a broken tool, and the tests are not run, because the suite
+  cannot import the module (`tests: not run, a file does not parse`);
 - a step that fails without writing a single finding (a crashed `quality`
   script, a mypy internal error): always blocks, as in strict mode;
 - whatever `draft_blocking` lists: a bare step name blocks that whole step, and

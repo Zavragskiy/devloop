@@ -451,6 +451,7 @@ class RecordingSteps:
         self.reported = dict(reported or {})
         self.verdicts: dict[str, bool] = {}
         self.ran: set[str] = set()
+        self.unparsed: set[str] = set()
         self.keep_going = keep_going
 
     @property
@@ -1964,10 +1965,29 @@ class DraftPipelineTest(unittest.TestCase):
         self.assertTrue(lines[-2].startswith("[verify] FAILED (draft; also deferred: 1 finding"))
         self.assertEqual(lines[-1], "[verify] failed: tests")
 
-    def test_a_syntax_error_blocks(self) -> None:
+    def test_a_syntax_error_blocks_and_skips_what_cannot_parse(self) -> None:
         code, text = self._check(self._draft(), ruff=ruff_json("invalid-syntax"))
         self.assertEqual(code, 1)
         self.assertIn("failed: ruff", text)
+        self.assertNotIn("format", self.ran)
+        self.assertNotIn("tests", self.ran)
+        self.assertIn("[verify] format: skipped 1 unparsed file", text)
+        self.assertIn("[verify] tests: not run, a file does not parse", text)
+        self.assertNotIn("the tool failed without a finding", text)
+
+    def test_format_still_checks_the_files_that_parse(self) -> None:
+        steps = RecordingSteps(outputs={"ruff": ruff_json("invalid-syntax")}, keep_going=True)
+        cli._static_steps(
+            self.cfg,
+            steps,
+            ["pkg/module.py", "pkg/other.py"],
+            full=False,
+            entries={},
+        )
+        formatted = [command for label, command in steps.commands if label == "format"]
+        self.assertEqual(len(formatted), 1)
+        self.assertNotIn("pkg/module.py", formatted[0])
+        self.assertIn("pkg/other.py", formatted[0])
 
     def test_an_undefined_name_blocks_by_default(self) -> None:
         code, text = self._check(self._draft(), ruff=ruff_json("F821", "F401"))

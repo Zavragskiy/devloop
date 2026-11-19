@@ -123,6 +123,7 @@ class Steps:
         self.pending: dict[str, tuple[bool, float]] = {}
         self.deferred: dict[str, int] = {}
         self.deferred_steps: list[str] = []
+        self.unparsed: set[str] = set()
 
     @property
     def stopped(self) -> bool:
@@ -364,15 +365,23 @@ def _static_steps(
                 defer_status=True,
             )
             found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
+            steps.unparsed.update(_unparsed(found))
             _settle(steps, "ruff", found, entries, full, detail=True, draft=draft)
-        steps.run_batched(
-            "format",
-            _batched(_python(cfg, "-m", "ruff", "format", "--check"), gated),
-            defer_status=entries is not None,
-        )
-        if entries is not None:
-            found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
-            _settle(steps, "format", found, entries, full, draft=draft)
+        # A file that does not parse makes ``ruff format`` fail without a
+        # ``Would reformat`` line, which reads as a broken tool. The syntax
+        # error already blocks, so the formatter never sees that file.
+        if not steps.stopped:
+            formattable = [path for path in gated if path not in steps.unparsed]
+            if formattable:
+                steps.run_batched(
+                    "format",
+                    _batched(_python(cfg, "-m", "ruff", "format", "--check"), formattable),
+                    defer_status=entries is not None,
+                )
+                if entries is not None:
+                    found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
+                    _settle(steps, "format", found, entries, full, draft=draft)
+            _skip_unparsed(len(gated) - len(formattable))
     if cfg.quality is not None and gated:
         steps.run_batched(
             "quality",
@@ -398,6 +407,21 @@ def _static_steps(
                 _settle(steps, "mypy", found, entries, full, detail=True, draft=draft)
     for spec in cfg.checks:
         _run_check(cfg, steps, spec, files, entries, full, draft=draft)
+
+
+def _unparsed(found: list[findings.Finding]) -> set[str]:
+    """Paths whose ruff finding is a syntax error, so later steps cannot parse them."""
+    return {
+        finding.key.rsplit(":", 1)[0]
+        for finding in found
+        if finding.key.rsplit(":", 1)[-1] in mode.SYNTAX_CODES
+    }
+
+
+def _skip_unparsed(count: int) -> None:
+    if count:
+        noun = "file" if count == 1 else "files"
+        print(f"[verify] format: skipped {count} unparsed {noun}")
 
 
 def _policy_step(cfg: Config, steps: Steps, draft: Draft | None) -> None:
@@ -475,6 +499,9 @@ def _test_step(
     args: argparse.Namespace,
     draft: Draft | None = None,
 ) -> None:
+    if steps.unparsed and not args.no_tests:
+        print("[verify] tests: not run, a file does not parse")
+        return
     command = _test_command(cfg, changes, args)
     if command is None:
         print("[verify] tests: skipped")
@@ -995,7 +1022,8 @@ CI can keep the accepted debt from rotting.
 Draft mode is for prototyping: devloop mode draft pins it for this checkout,
 --mode draft sets it for one run. A plain check runs every step (draft implies
 --keep-going) but fails
-only on a file that does not parse, a tool that breaks without a finding and
+only on a file that does not parse (its formatting and tests are skipped), a tool
+that breaks without a finding and
 what [tool.devloop.modes] draft_blocking lists (undefined names and the affected
 tests by default); everything else is counted on the last line as deferred and
 blocks at --full, which is always strict. --show-deferred prints the deferred

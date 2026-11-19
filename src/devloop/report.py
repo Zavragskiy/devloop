@@ -78,6 +78,15 @@ def new_findings(step: str, fresh: list[Finding], known: int, *, detail: bool = 
         print(f"[verify] {step}: 0 new findings, {known} baselined")
 
 
+def deferred_findings(step: str, deferred: list[Finding], *, detail: bool = False) -> None:
+    """Print what a draft run deferred, for ``--show-deferred`` only."""
+    print(f"[verify] {step}: deferred until --full:")
+    for finding in deferred[:FINDINGS_TAIL]:
+        print(f"  {finding.message}  ({finding.key})" if detail else f"  {finding.key}")
+    if len(deferred) > FINDINGS_TAIL:
+        print(f"  ... and {len(deferred) - FINDINGS_TAIL} more")
+
+
 def stale_entries(step: str, stale: list[str]) -> None:
     """Print baseline keys that this full run no longer reports."""
     print(f"[verify] {step}: {len(stale)} stale baseline entries, devloop baseline refreshes")

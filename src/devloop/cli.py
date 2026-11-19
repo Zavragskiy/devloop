@@ -25,6 +25,7 @@ from devloop import (
     findings,
     gitinfo,
     impact,
+    mode,
     process,
     report,
     selector,
@@ -118,9 +119,12 @@ class Steps:
         self.outputs: dict[str, str] = {}
         self.ran: set[str] = set()
         self.pending: dict[str, tuple[bool, float]] = {}
+        self.deferred: dict[str, int] = {}
+        self.deferred_steps: list[str] = []
 
     @property
     def stopped(self) -> bool:
+        """Only a blocking failure stops the run; a deferred step never does."""
         return bool(self.failures) and not self.keep_going
 
     def report_path(self, label: str) -> Path:
@@ -235,6 +239,23 @@ class Steps:
         if pending is not None:
             print(f"[verify] {label}: {'ok' if ok else 'FAILED'} ({pending[1]:.1f}s)")
 
+    def defer(self, label: str, count: int | None) -> None:
+        """Clear a draft step's failure and count it as deferred.
+
+        ``count`` is the number of deferred findings, or ``None`` for a step
+        whose verdict is only its exit code (``policy``, the tests).
+        """
+        self.failures[:] = [failure for failure in self.failures if failure != label]
+        if count is None:
+            self.deferred_steps.append(label)
+            word = "deferred"
+        else:
+            self.deferred[label] = count
+            word = f"{count} deferred"
+        pending = self.pending.pop(label, None)
+        timing = f" ({pending[1]:.1f}s)" if pending is not None else ""
+        print(f"[verify] {label}: {word}{timing}")
+
     def failure_output(self, label: str) -> str:
         """The captured output of a quiet step, for a failure that parsed nothing."""
         return self.outputs.get(label, "")
@@ -245,6 +266,14 @@ def _collected(steps: Steps, label: str) -> list[findings.Finding]:
     return collect(label) if callable(collect) else []
 
 
+@dataclass(frozen=True)
+class Draft:
+    """A draft run: what still blocks, and whether deferred detail is printed."""
+
+    blocking: mode.Blocking
+    show: bool = False
+
+
 def _settle(
     steps: Steps,
     label: str,
@@ -253,14 +282,31 @@ def _settle(
     full: bool,
     *,
     detail: bool = False,
+    draft: Draft | None = None,
 ) -> None:
-    """Decide one step by what a baseline already accepts."""
+    """Decide one step by what a baseline already accepts.
+
+    In draft a new finding blocks only when ``draft_blocking`` (or a syntax
+    error) says so; the rest is deferred. A step that failed without any
+    finding falls through to the strict path and stays a failure.
+    """
     if label not in steps.ran:
         return
     comparison = baseline.compare(entries, {label: found}, [label], full=full)
     fresh = list(comparison.new.get(label, ()))
     known_keys = entries.get(label, set())
     known = len({finding.key for finding in found if finding.key in known_keys})
+    if draft is not None and fresh:
+        blocking = [finding for finding in fresh if draft.blocking.blocks(label, finding)]
+        deferred = [finding for finding in fresh if finding not in blocking]
+        if deferred and draft.show:
+            report.deferred_findings(label, deferred, detail=detail)
+        if blocking:
+            report.new_findings(label, blocking, known, detail=detail)
+            steps.settle(label, ok=False)
+        else:
+            steps.defer(label, len(deferred))
+        return
     if fresh:
         report.new_findings(label, fresh, known, detail=detail)
         steps.settle(label, ok=False)
@@ -290,7 +336,9 @@ def _static_steps(
     *,
     entries: dict[str, set[str]] | None = None,
     changed_only: bool = False,
+    draft: Draft | None = None,
 ) -> None:
+    """Run the static gates; ``draft`` needs ``entries`` (``{}`` without a baseline)."""
     gated = _all_python(cfg) if full else files
     if gated:
         if entries is None:
@@ -305,7 +353,7 @@ def _static_steps(
                 defer_status=True,
             )
             found = findings.parse_ruff(steps.outputs.get("ruff", ""), cfg.root)
-            _settle(steps, "ruff", found, entries, full, detail=True)
+            _settle(steps, "ruff", found, entries, full, detail=True, draft=draft)
         steps.run_batched(
             "format",
             _batched(_python(cfg, "-m", "ruff", "format", "--check"), gated),
@@ -313,7 +361,7 @@ def _static_steps(
         )
         if entries is not None:
             found = findings.parse_ruff_format(steps.outputs.get("format", ""), cfg.root)
-            _settle(steps, "format", found, entries, full)
+            _settle(steps, "format", found, entries, full, draft=draft)
     if cfg.quality is not None and gated:
         steps.run_batched(
             "quality",
@@ -321,9 +369,9 @@ def _static_steps(
             defer_status=entries is not None,
         )
         if entries is not None:
-            _settle(steps, "quality", _collected(steps, "quality"), entries, full)
+            _settle(steps, "quality", _collected(steps, "quality"), entries, full, draft=draft)
     if cfg.policy is not None:
-        steps.run("policy", _python(cfg, str(cfg.policy)))
+        _policy_step(cfg, steps, draft)
     if full or any(_is_source(cfg, path) for path in files):
         if changed_only and full:
             print("[verify] mypy: changed-only is ignored on --full, the whole scope is checked")
@@ -336,9 +384,29 @@ def _static_steps(
             steps.run("mypy", command, defer_status=entries is not None)
             if entries is not None:
                 found = findings.parse_mypy(steps.outputs.get("mypy", ""), cfg.root)
-                _settle(steps, "mypy", found, entries, full, detail=True)
+                _settle(steps, "mypy", found, entries, full, detail=True, draft=draft)
     for spec in cfg.checks:
-        _run_check(cfg, steps, spec, files, entries, full)
+        _run_check(cfg, steps, spec, files, entries, full, draft=draft)
+
+
+def _policy_step(cfg: Config, steps: Steps, draft: Draft | None) -> None:
+    """The policy gate writes no keys, so in draft its exit code is deferred whole."""
+    assert cfg.policy is not None
+    command = _python(cfg, str(cfg.policy))
+    if draft is None or "policy" in draft.blocking.steps:
+        steps.run("policy", command)
+        return
+    if steps.run("policy", command, defer_status=True):
+        steps.settle("policy", ok=True)
+        return
+    if draft.show:
+        _print_tail(steps.failure_output("policy"))
+    steps.defer("policy", None)
+
+
+def _print_tail(output: str) -> None:
+    for line in _tail(output).splitlines():
+        print(f"  {line}")
 
 
 def _run_check(
@@ -350,6 +418,7 @@ def _run_check(
     full: bool,
     *,
     defer_status: bool = False,
+    draft: Draft | None = None,
 ) -> None:
     """Run one ``[[tool.devloop.check]]`` command with the paths it asked for."""
     if spec.paths == "changed":
@@ -366,7 +435,7 @@ def _run_check(
     deferred = defer_status or entries is not None
     steps.run_batched(spec.name, _batched(command, targets), defer_status=deferred)
     if entries is not None:
-        _settle(steps, spec.name, _collected(steps, spec.name), entries, full)
+        _settle(steps, spec.name, _collected(steps, spec.name), entries, full, draft=draft)
 
 
 def _scope_targets(cfg: Config, files: list[str]) -> list[str]:
@@ -389,7 +458,11 @@ def _mypy_command(
 
 
 def _test_step(
-    cfg: Config, steps: Steps, changes: list[gitinfo.Change], args: argparse.Namespace
+    cfg: Config,
+    steps: Steps,
+    changes: list[gitinfo.Change],
+    args: argparse.Namespace,
+    draft: Draft | None = None,
 ) -> None:
     command = _test_command(cfg, changes, args)
     if command is None:
@@ -399,8 +472,16 @@ def _test_step(
         print("[verify] tests: not run, a static step failed")
         print("[verify] --keep-going runs them anyway; --tests-only skips the static steps")
         return
-    if not steps.run("tests", command):
+    if draft is None or "tests" in draft.blocking.steps:
+        if not steps.run("tests", command):
+            report.test_failures(cfg)
+        return
+    if steps.run("tests", command, defer_status=True):
+        steps.settle("tests", ok=True)
+        return
+    if draft.show:
         report.test_failures(cfg)
+    steps.defer("tests", None)
 
 
 def _explicit_selection(args: argparse.Namespace) -> bool:
@@ -561,12 +642,35 @@ def _indented(paths: list[str] | tuple[str, ...]) -> None:
         print(f"  {path}")
 
 
-def _finish(steps: Steps) -> int:
-    print(f"[verify] {'FAILED' if steps.failures else 'ok'} in {steps.seconds:.1f}s")
+def _finish(steps: Steps, draft: bool = False) -> int:
     if steps.failures:
+        print(f"[verify] FAILED in {steps.seconds:.1f}s")
         print(f"[verify] failed: {', '.join(steps.failures)}")
         return 1
+    if draft:
+        print(f"[verify] ok (draft; {_deferred_summary(steps)}) in {steps.seconds:.1f}s")
+    else:
+        print(f"[verify] ok in {steps.seconds:.1f}s")
     return 0
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _deferred_summary(steps: Steps) -> str:
+    """The deferred part of the draft tail: findings and whole steps, never mixed."""
+    counted = {label: count for label, count in steps.deferred.items() if count}
+    parts: list[str] = []
+    if counted:
+        detail = ", ".join(f"{label} {count}" for label, count in counted.items())
+        parts.append(f"{_plural(sum(counted.values()), 'finding')} ({detail})")
+    if steps.deferred_steps:
+        names = ", ".join(steps.deferred_steps)
+        parts.append(f"{_plural(len(steps.deferred_steps), 'step')} ({names})")
+    if not parts:
+        return "nothing deferred"
+    return f"deferred: {', '.join(parts)} - they block at commit, nothing to do now"
 
 
 def _cache_key(cfg: Config, args: argparse.Namespace) -> str | None:
@@ -594,6 +698,7 @@ def run_check(args: argparse.Namespace) -> int:
     cfg = config.load()
     if args.tests_only and args.no_tests:
         raise ValueError("--tests-only and --no-tests contradict each other")
+    current = mode.resolve(cfg, args.mode, full=args.full)
     if args.files and not args.no_tests:
         _checked_files(cfg, args.files)
     changes = gitinfo.collect(cfg.root, args.base)
@@ -601,14 +706,19 @@ def run_check(args: argparse.Namespace) -> int:
     markers = [name for name, on in (("full", args.full), ("tests only", args.tests_only)) if on]
     scope = f" ({', '.join(markers)})" if markers else ""
     print(f"[verify] {_changed_count(changes)} changed, {len(files)} Python file(s){scope}")
+    if not current.quiet_default:
+        print(f"[verify] {current.header}")
 
     key = _cache_key(cfg, args)
     if key is not None and verdict.recent(cfg, key):
         print("[verify] this tree already passed the full gate; nothing to re-check")
         return 0
     entries = _baseline_entries(cfg)
-    quiet = frozenset({"ruff", "format", "mypy"}) if entries is not None else frozenset()
-    steps = Steps(cfg, args.keep_going, quiet=quiet)
+    draft: Draft | None = None
+    if current.draft:
+        draft = Draft(mode.Blocking.parse(cfg.draft_blocking), args.show_deferred)
+        entries = {} if entries is None else entries
+    steps = Steps(cfg, args.keep_going, quiet=_quiet(cfg, entries, draft))
     if not args.tests_only:
         _static_steps(
             cfg,
@@ -617,12 +727,26 @@ def run_check(args: argparse.Namespace) -> int:
             args.full,
             entries=entries,
             changed_only=args.changed_only or cfg.mypy_changed_only,
+            draft=draft,
         )
-    _test_step(cfg, steps, changes, args)
-    code = _finish(steps)
+    _test_step(cfg, steps, changes, args, draft)
+    code = _finish(steps, draft=draft is not None)
     if code == 0 and key is not None:
         verdict.remember(cfg, key)
     return code
+
+
+def _quiet(cfg: Config, entries: dict[str, set[str]] | None, draft: Draft | None) -> frozenset[str]:
+    """Steps whose own output is captured instead of forwarded.
+
+    With parsed findings devloop reprints what matters; in draft a step that
+    does not block is silenced entirely, so its output cannot read as a failure.
+    """
+    quiet = {"ruff", "format", "mypy"} if entries is not None else set()
+    if draft is not None and not draft.show:
+        candidates = {"quality", "policy", "tests", *(spec.name for spec in cfg.checks)}
+        quiet |= candidates - draft.blocking.steps
+    return frozenset(quiet)
 
 
 def _changed_count(changes: list[gitinfo.Change]) -> int:
@@ -731,6 +855,12 @@ def run_baseline(args: argparse.Namespace) -> int:
     cfg = config.load()
     if cfg.baseline is None:
         raise ValueError('the baseline is disabled by [tool.devloop] baseline = ""')
+    current = mode.resolve(cfg, args.mode)
+    if current.draft and not args.check:
+        raise ValueError(
+            f"baseline is refused: mode draft via {_mode_origin(cfg, current)}; draft findings "
+            "are not accepted debt (devloop mode strict, or --mode strict for this run)"
+        )
     quiet = frozenset({"ruff", "format", "mypy"})
     # Collecting is not gating: a step that reports findings is expected to exit
     # nonzero, and stopping there would drop every later step from the file.
@@ -746,6 +876,28 @@ def run_baseline(args: argparse.Namespace) -> int:
     for step in sorted(observed):
         print(f"[verify] {step}: {len({finding.key for finding in observed[step]})} finding(s)")
     print(f"[verify] baseline written to {cfg.baseline}")
+    return 0
+
+
+def _mode_origin(cfg: Config, current: mode.Mode) -> str:
+    if current.source == "file":
+        return _relative(cfg, mode.mode_file(cfg))
+    if current.source == "default":
+        return "[tool.devloop.modes] default"
+    return current.source
+
+
+def run_mode(args: argparse.Namespace) -> int:
+    """Pin this checkout to a mode (or drop the pin) and print how it resolves."""
+    cfg = config.load()
+    if args.value is not None:
+        mode.write_file(cfg, None if args.value == "default" else args.value)
+    current = mode.resolve(cfg, args.mode)
+    print(f"[verify] {current.header}")
+    for source, value in mode.chain(cfg, args.mode):
+        label = _relative(cfg, mode.mode_file(cfg)) if source == "file" else source
+        print(f"  {label}: {value or '-'}")
+    print(f"  CI: {os.environ.get('CI') or '-'}")
     return 0
 
 
@@ -793,6 +945,14 @@ findings a tree already has: check fails only on new ones, and --full names the
 entries that no longer match. devloop baseline rewrites it from the whole tree;
 devloop baseline --check fails when a new finding or a stale entry appears, so
 CI can keep the accepted debt from rotting.
+
+Draft mode is for prototyping: devloop mode draft pins it for this checkout,
+--mode draft sets it for one run. A plain check still runs every step but fails
+only on a file that does not parse, a tool that breaks without a finding and
+what [tool.devloop.modes] draft_blocking lists (undefined names and the affected
+tests by default); everything else is counted on the last line as deferred and
+blocks at --full, which is always strict. --show-deferred prints the deferred
+detail; --explain stays the test selection. devloop mode default drops the pin.
 """
 
 DESCRIPTION = """\
@@ -812,10 +972,29 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
         "command",
         nargs="?",
         default=default,
-        choices=("check", "baseline", "impact", "changed", "select-tests"),
+        choices=("check", "baseline", "impact", "changed", "select-tests", "mode"),
         help="check runs the pipeline (default); baseline freezes today's findings; "
         "impact prints the selected test files; changed lists the git changes the "
-        "selection sees; select-tests prints the test files the built-in selector picks",
+        "selection sees; select-tests prints the test files the built-in selector picks; "
+        "mode prints or pins the working mode",
+    )
+    parser.add_argument(
+        "value",
+        nargs="?",
+        choices=("draft", "strict", "default"),
+        help="mode command: pin this checkout to draft or strict; default removes the pin",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=config.MODES,
+        default=None,
+        help="the mode of this run, over DEVLOOP_MODE, the pinned mode and the configured "
+        "default; --full is always strict",
+    )
+    parser.add_argument(
+        "--show-deferred",
+        action="store_true",
+        help="draft mode: print the deferred findings and the output of deferred steps",
     )
     parser.add_argument(
         "--full",
@@ -880,8 +1059,13 @@ def build_parser(default: str = "check", prog: str = "devloop") -> argparse.Argu
 
 
 def main(argv: list[str] | None = None, default: str = "check", prog: str = "devloop") -> int:
-    args = build_parser(default, prog).parse_args(argv)
+    parser = build_parser(default, prog)
+    args = parser.parse_args(argv)
+    if args.value is not None and args.command != "mode":
+        parser.error(f"{args.value!r} is only a value of the mode command")
     try:
+        if args.command == "mode":
+            return run_mode(args)
         if args.command == "baseline":
             return run_baseline(args)
         if args.command == "impact":

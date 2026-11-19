@@ -320,6 +320,8 @@ nothing parseable, the command exits `2` and leaves the old baseline in place.
 | `mypy.scope` | empty | Paths passed to mypy; empty keeps the project's own mypy config. |
 | `mypy.changed_only` | `false` | mypy checks only the changed files inside the scope. |
 | `check` | empty | Extra `[[tool.devloop.check]]` steps, run in declaration order. |
+| `modes.default` | `strict` | The mode when no flag, variable or pin names one. |
+| `modes.draft_blocking` | `["ruff:F821,F822,F823", "tests"]` | What a draft run still fails on; `[]` opts out. |
 
 `devloop --help` prints the same switches as the installed version.
 
@@ -402,6 +404,98 @@ Two flags escape that, and they mean different things:
 
 Do not read `--tests-only` as a way to pass the gate: it gates nothing, and a
 green `--tests-only` run is never remembered by the verdict cache.
+
+## Draft mode
+
+Both flags above are draft mode done by hand, with the agent deciding when to
+relax. Draft mode moves that decision into the tool: the agent keeps running the
+same `devloop check`, and the mode decides what fails.
+
+```powershell
+poetry run devloop mode draft     # pin this checkout
+poetry run devloop mode           # print the mode and every source
+poetry run devloop mode default   # drop the pin
+poetry run devloop check --mode draft   # one run, without a pin
+```
+
+A draft `check` runs every step, so nothing is skipped, but a new finding fails
+the run only when it means the code is broken:
+
+- a file that does not parse (ruff `invalid-syntax`): always blocks;
+- a step that fails without writing a single finding (a crashed `quality`
+  script, a mypy internal error): always blocks, as in strict mode;
+- whatever `draft_blocking` lists: a bare step name blocks that whole step, and
+  `ruff:<prefixes>` blocks only those ruff codes.
+
+```toml
+[tool.devloop.modes]
+default = "strict"
+draft_blocking = ["ruff:F821,F822,F823", "tests"]   # the default
+```
+
+`F` alone is the whole Pyflakes family, so `F401` (unused import) and `F841`
+(unused variable) would block a half-written file again. Choose it only if you
+want that. An unknown step or a malformed selector is a configuration error.
+`policy` and the tests have no findings, only an exit code, so when they are not
+listed they are deferred as whole steps. With a baseline, only findings the
+baseline does not list are counted.
+
+Every other finding is deferred. The step prints a neutral line instead of
+`FAILED`, its own output is captured, and the last line stays `ok`:
+
+```text
+[verify] mode: draft (file)
+[verify] quality: 4 deferred (1.2s)
+[verify] policy: deferred (0.1s)
+...
+[verify] ok (draft; deferred: 9 findings (quality 4, mypy 3, ruff 2), 1 step (policy) - they block at commit, nothing to do now) in 3.1s
+```
+
+`--show-deferred` prints the deferred findings and the captured output;
+`--explain` keeps meaning the test selection.
+
+The mode comes from the first source that names one: `--mode`, `DEVLOOP_MODE`,
+the pin in `<cache_dir>/mode`, then `modes.default`. Three rules keep draft
+findings out of a merge:
+
+- `--full` is always strict. A pinned draft is ignored with a line saying so, and
+  `--full --mode draft` is an error. Only `--full` writes the verdict cache, so a
+  draft run can never mark a tree as passed.
+- When `CI` is set, the mode is strict whatever the source.
+- `devloop baseline` refuses to write in draft (exit `2`) and names the source,
+  so draft findings cannot be frozen as accepted debt. `baseline --check` still
+  runs.
+
+The pin is one file per checkout, shared by every session working in it. Two
+agents in one tree see the same mode, and each worktree has its own. Use
+`--mode` for a one-off run.
+
+### The commit gate that collects the deferred work
+
+Draft mode is only safe when a strict `--full` actually runs before code
+lands. A pre-commit hook makes that the moment when everything deferred comes
+back in one report:
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      - id: devloop
+        name: devloop full gate
+        entry: poetry run devloop check --full --keep-going
+        language: system
+        pass_filenames: false
+        always_run: true
+```
+
+`--full` must run the suite the way the project runs it. A sharded or isolated
+suite needs `runner` configured (see [Runner recipes](#runner-recipes)). Without
+it, `--full` either fails on the isolation and not on the change, or the hook
+falls back to `--no-tests`. A hook with `--no-tests` gets no test signal at all,
+so such a project needs either the runner or a separate `--full` job in CI.
+Blocking `git commit --no-verify` is up to the project, for example a Cursor
+`preToolUse` hook on `Shell`.
 
 ## Migrating from an in-repo copy
 

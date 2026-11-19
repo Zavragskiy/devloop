@@ -84,6 +84,8 @@ From the consuming project's root, in its own environment:
 | `devloop check --last-failed` | gate the change, replay the last run's failures |
 | `devloop check --base origin/main` | a branch diff instead of the working tree |
 | `devloop check --changed-only` | mypy over the changed files inside its scope |
+| `devloop mode draft` / `strict` / `default` | pin this checkout's edit-loop mode, or drop the pin |
+| `devloop check --mode draft` | one draft run: only breakage fails, the rest is deferred |
 | `devloop baseline` | freeze the findings the tree has today |
 | `devloop baseline --check` | fail when the baseline has a new or a stale entry |
 | `devloop impact` | print the affected test files, run nothing |
@@ -107,6 +109,17 @@ The default changed mode is the edit loop: it gates the files you touched and
 the tests they affect, and returns in seconds. `--full` is the commit and stage
 gate: it gates every tracked file and runs the whole suite. Use `--full` before a
 commit or at the end of a stage, not after every edit.
+
+### Draft mode for new code
+
+While prototyping, every red quality or format line pulls an agent into
+polishing code that will change in the next turn. In draft mode (`devloop mode
+draft`) the edit loop still runs every step but fails only on what breaks the
+code: a file that does not parse, a tool that crashes, undefined names and the
+affected tests. Everything else is counted on the last line, `ok (draft;
+deferred: ...)`, and blocks at `--full`, which is always strict. The commit gate
+then reports it all in one pass. See
+[docs/integration.md](docs/integration.md#draft-mode).
 
 ### Selection safety
 

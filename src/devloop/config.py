@@ -22,6 +22,7 @@ this package stays free of project knowledge.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 import tomllib
@@ -43,6 +44,12 @@ DEFAULTS: dict[str, Any] = {
 }
 
 CHECK_PATHS = ("none", "changed", "all")
+
+MODES = ("strict", "draft")
+DRAFT_BLOCKING = ("ruff:F821,F822,F823", "tests")
+"""What a draft run still fails on when ``draft_blocking`` is not configured."""
+BUILTIN_STEPS = ("ruff", "format", "quality", "policy", "mypy", "tests")
+RUFF_CODE = re.compile(r"[A-Z]+[0-9]*")
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,8 @@ class Config:
     mypy_scope: tuple[str, ...] = ()
     mypy_changed_only: bool = False
     checks: tuple[CheckSpec, ...] = ()
+    mode_default: str = "strict"
+    draft_blocking: tuple[str, ...] = DRAFT_BLOCKING
 
     @property
     def environment(self) -> dict[str, str]:
@@ -200,6 +209,44 @@ def _checks(raw: object) -> tuple[CheckSpec, ...]:
     return tuple(specs)
 
 
+def _modes(raw: object, checks: tuple[CheckSpec, ...]) -> tuple[str, tuple[str, ...]]:
+    """``[tool.devloop.modes]``: the default mode and what a draft run still fails on.
+
+    A typo in ``draft_blocking`` would quietly turn a gate off, so every entry
+    must name a known step, and only ``ruff`` narrows itself with code prefixes.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("[tool.devloop.modes] must be a table")
+    default = raw.get("default", "strict")
+    if default not in MODES:
+        raise ValueError(f"[tool.devloop.modes] default must be one of {', '.join(MODES)}")
+    entries = raw.get("draft_blocking", list(DRAFT_BLOCKING))
+    if not isinstance(entries, list) or not all(isinstance(item, str) for item in entries):
+        raise ValueError("[tool.devloop.modes] draft_blocking must be a list of strings")
+    known = {*BUILTIN_STEPS, *(spec.name for spec in checks)}
+    seen: set[str] = set()
+    for entry in entries:
+        step, _, selectors = entry.partition(":")
+        if step not in known:
+            raise ValueError(f"[tool.devloop.modes] draft_blocking: unknown step {step!r}")
+        if step in seen:
+            raise ValueError(f"[tool.devloop.modes] draft_blocking: {step} is listed twice")
+        seen.add(step)
+        if ":" not in entry:
+            continue
+        if step != "ruff":
+            raise ValueError(
+                f"[tool.devloop.modes] draft_blocking: only ruff takes code prefixes, not {step}"
+            )
+        codes = selectors.split(",")
+        if not all(RUFF_CODE.fullmatch(code) for code in codes):
+            raise ValueError(
+                f"[tool.devloop.modes] draft_blocking: {entry!r} needs ruff code prefixes "
+                "such as ruff:F821,F822"
+            )
+    return default, tuple(entries)
+
+
 def load(root: Path | None = None) -> Config:
     """Resolve the settings of the project at ``root`` (or the nearest one)."""
     root = (root or find_root()).resolve()
@@ -214,6 +261,8 @@ def load(root: Path | None = None) -> Config:
     if not 0 < fraction <= 1:
         raise ValueError("[tool.devloop] max_fraction must be greater than 0 and at most 1")
     scope, changed_only = _mypy_settings(root, table.get("mypy", {}))
+    checks = _checks(table.get("check", []))
+    mode_default, draft_blocking = _modes(table.get("modes", {}), checks)
     return Config(
         root=root,
         python=sys.executable,
@@ -231,5 +280,7 @@ def load(root: Path | None = None) -> Config:
         env=_environment(root, table.get("env", {})),
         mypy_scope=scope,
         mypy_changed_only=changed_only,
-        checks=_checks(table.get("check", [])),
+        checks=checks,
+        mode_default=mode_default,
+        draft_blocking=draft_blocking,
     )

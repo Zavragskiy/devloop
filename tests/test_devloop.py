@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from devloop import __version__ as devloop_version  # noqa: E402
 from devloop import (  # noqa: E402
     baseline,
     cli,
@@ -1839,6 +1840,10 @@ class BlockingRuleTest(unittest.TestCase):
         rule = mode.Blocking.parse(("mypy",))
         self.assertTrue(rule.blocks("mypy", self._finding("mypy", "attr-defined")))
 
+    def test_a_prefix_that_names_no_rule_is_reported(self) -> None:
+        rule = mode.Blocking.parse(("ruff:F821,Z9,F83",))
+        self.assertEqual(mode.unmatched_prefixes(rule, ["F821", "F841", "E501"]), ["Z9", "F83"])
+
 
 class DraftPipelineTest(unittest.TestCase):
     """A draft ``check`` runs every step and fails only on what breaks the code."""
@@ -1969,6 +1974,18 @@ class DraftPipelineTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("msg F821", text)
 
+    def test_a_blocking_finding_does_not_skip_the_later_steps(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821"), unformatted=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.ran, ["ruff", "format", "quality", "policy", "mypy", "tests"])
+        self.assertNotIn("tests: not run", text)
+        self.assertIn("FAILED (draft; also deferred: 1 finding (format 1))", text)
+
+    def test_a_failed_draft_run_without_deferred_work_still_says_draft(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821"))
+        self.assertEqual(code, 1)
+        self.assertIn("[verify] FAILED (draft) in", text)
+
     def test_a_tool_that_fails_without_a_finding_stays_blocking(self) -> None:
         code, text = self._check(self._draft(), quality_crash=True)
         self.assertEqual(code, 1)
@@ -2016,16 +2033,29 @@ class ModeCommandTest(unittest.TestCase):
         self.root = Path(self._temp.name).resolve()
         self.cfg = fake_config(self.root, baseline=self.root / "devloop-baseline.json")
 
-    def _main(self, *argv: str) -> tuple[int, str, str]:
+    def _main(self, *argv: str, rules: str = '[{"code": "F821"}]') -> tuple[int, str, str]:
         output, errors = StringIO(), StringIO()
+        listed = subprocess.CompletedProcess([], 0, rules, "")
         with (
             patch("devloop.cli.config.load", return_value=self.cfg),
+            patch.object(cli.process, "run", return_value=listed),
             patch.dict("os.environ", NO_MODE_ENV),
             redirect_stdout(output),
             redirect_stderr(errors),
         ):
             code = cli.main(list(argv))
         return code, output.getvalue(), errors.getvalue()
+
+    def test_mode_names_the_installed_build_and_an_unknown_prefix(self) -> None:
+        code, text, _ = self._main("mode", rules='[{"code": "F821"}, {"code": "F822"}]')
+        self.assertEqual(code, 0)
+        self.assertIn(f"devloop: {devloop_version}", text)
+        self.assertIn("ruff:F823 matches no ruff rule", text)
+        self.assertNotIn("ruff:F821 matches", text)
+
+    def test_an_unreadable_rule_list_is_said_not_guessed(self) -> None:
+        _, text, _ = self._main("mode", rules="not json")
+        self.assertIn("could not list the ruff rules", text)
 
     def test_mode_pins_prints_the_chain_and_unpins(self) -> None:
         code, text, _ = self._main("mode", "draft")

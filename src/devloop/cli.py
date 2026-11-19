@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import sys
 import time
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devloop import (
+    __version__,
     baseline,
     config,
     findings,
@@ -655,8 +657,10 @@ def _indented(paths: list[str] | tuple[str, ...]) -> None:
 def _finish(steps: Steps, draft: bool = False) -> int:
     deferred = _deferred_summary(steps) if draft else ""
     if steps.failures:
-        also = f" (draft; also deferred: {deferred})" if deferred else ""
-        print(f"[verify] FAILED{also} in {steps.seconds:.1f}s")
+        marker = ""
+        if draft:
+            marker = f" (draft; also deferred: {deferred})" if deferred else " (draft)"
+        print(f"[verify] FAILED{marker} in {steps.seconds:.1f}s")
         print(f"[verify] failed: {', '.join(steps.failures)}")
         return 1
     if not draft:
@@ -733,7 +737,10 @@ def run_check(args: argparse.Namespace) -> int:
     if current.draft:
         draft = Draft(mode.Blocking.parse(cfg.draft_blocking), args.show_deferred)
         entries = {} if entries is None else entries
-    steps = Steps(cfg, args.keep_going, quiet=_quiet(cfg, entries, draft))
+    # Draft keeps going past a blocking finding: the deferred total stays complete
+    # and the tests still report, so "tests: not run" never appears in draft.
+    keep_going = args.keep_going or draft is not None
+    steps = Steps(cfg, keep_going, quiet=_quiet(cfg, entries, draft))
     if not args.tests_only:
         _static_steps(
             cfg,
@@ -914,7 +921,30 @@ def run_mode(args: argparse.Namespace) -> int:
         label = _relative(cfg, mode.mode_file(cfg)) if source == "file" else source
         print(f"  {label}: {value or '-'}")
     print(f"  CI: {os.environ.get('CI') or '-'}")
+    print(f"  draft_blocking: {', '.join(cfg.draft_blocking) or '-'}")
+    print(f"  devloop: {__version__}")
+    _check_ruff_prefixes(cfg)
     return 0
+
+
+def _check_ruff_prefixes(cfg: Config) -> None:
+    """Warn about a ``draft_blocking`` ruff prefix that matches no installed rule."""
+    blocking = mode.Blocking.parse(cfg.draft_blocking)
+    if not blocking.ruff_codes:
+        return
+    command = _python(cfg, "-m", "ruff", "rule", "--all", "--output-format", "json")
+    result = process.run(command, cwd=cfg.root, env={**os.environ, **cfg.environment})
+    try:
+        rules = json.loads(result.stdout)
+        codes = [str(rule["code"]) for rule in rules]
+    except (ValueError, TypeError, KeyError):
+        print("[verify] draft_blocking: could not list the ruff rules to check the prefixes")
+        return
+    for prefix in mode.unmatched_prefixes(blocking, codes):
+        print(
+            f"[verify] draft_blocking: ruff:{prefix} matches no ruff rule, so it blocks "
+            "nothing (ruff rule --all lists the codes)"
+        )
 
 
 def run_impact(args: argparse.Namespace) -> int:
@@ -963,7 +993,8 @@ devloop baseline --check fails when a new finding or a stale entry appears, so
 CI can keep the accepted debt from rotting.
 
 Draft mode is for prototyping: devloop mode draft pins it for this checkout,
---mode draft sets it for one run. A plain check still runs every step but fails
+--mode draft sets it for one run. A plain check runs every step (draft implies
+--keep-going) but fails
 only on a file that does not parse, a tool that breaks without a finding and
 what [tool.devloop.modes] draft_blocking lists (undefined names and the affected
 tests by default); everything else is counted on the last line as deferred and

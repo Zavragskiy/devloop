@@ -418,8 +418,10 @@ poetry run devloop mode default   # drop the pin
 poetry run devloop check --mode draft   # one run, without a pin
 ```
 
-A draft `check` runs every step, so nothing is skipped, but a new finding fails
-the run only when it means the code is broken:
+A draft `check` runs every step, so nothing is skipped: draft implies
+`--keep-going`, and a blocking finding fails the run without hiding the later
+steps or the tests. A new finding fails the run only when it means the code is
+broken:
 
 - a file that does not parse (ruff `invalid-syntax`): always blocks;
 - a step that fails without writing a single finding (a crashed `quality`
@@ -435,7 +437,11 @@ draft_blocking = ["ruff:F821,F822,F823", "tests"]   # the default
 
 `F` alone is the whole Pyflakes family, so `F401` (unused import) and `F841`
 (unused variable) would block a half-written file again. Choose it only if you
-want that. An unknown step or a malformed selector is a configuration error.
+want that. An unknown step or a malformed selector is a configuration error. A
+well-formed prefix is not checked against ruff when the configuration loads, so
+`devloop mode` lists the installed ruff rules and warns about a prefix that
+matches none (`ruff:F831` for `ruff:F821` would block nothing). Run it after
+changing the set.
 `policy` and the tests have no findings, only an exit code, so when they are not
 listed they are deferred as whole steps. With a baseline, only findings the
 baseline does not list are counted.
@@ -453,7 +459,8 @@ Every other finding is deferred. The step prints a neutral line instead of
 
 A run that does fail names what it deferred as well, so the total is visible
 before the first green run: `[verify] FAILED (draft; also deferred: 6 findings
-(...)) in 1.5s`, then `failed: <steps>`. A step with both kinds of findings
+(...)) in 1.5s` (or `FAILED (draft)` when nothing was deferred), then
+`failed: <steps>`. A step with both kinds of findings
 prints its blocking findings and `<step>: N more deferred`.
 
 `--show-deferred` prints the deferred findings and the captured output of the

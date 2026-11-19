@@ -79,6 +79,19 @@ class Blocking:
         return code in SYNTAX_CODES or code.startswith(self.ruff_codes)
 
 
+def unmatched_prefixes(blocking: Blocking, rule_codes: list[str]) -> list[str]:
+    """``draft_blocking`` ruff prefixes that name no rule of the installed ruff.
+
+    A well-formed typo (``F831`` for ``F821``) is not a load error, and it would
+    move the findings it meant to block into the deferred count.
+    """
+    return [
+        prefix
+        for prefix in blocking.ruff_codes
+        if not any(code.startswith(prefix) for code in rule_codes)
+    ]
+
+
 def mode_file(cfg: Config) -> Path:
     return cfg.cache_dir / MODE_FILE
 

@@ -266,6 +266,10 @@ def _collected(steps: Steps, label: str) -> list[findings.Finding]:
     return collect(label) if callable(collect) else []
 
 
+PARSED_STEPS = frozenset({"ruff", "format", "mypy"})
+"""Steps whose findings devloop parses and reprints itself."""
+
+
 @dataclass(frozen=True)
 class Draft:
     """A draft run: what still blocks, and whether deferred detail is printed."""
@@ -301,11 +305,16 @@ def _settle(
         deferred = [finding for finding in fresh if finding not in blocking]
         if deferred and draft.show:
             report.deferred_findings(label, deferred, detail=detail)
-        if blocking:
-            report.new_findings(label, blocking, known, detail=detail)
-            steps.settle(label, ok=False)
-        else:
+            if label not in PARSED_STEPS:
+                _print_tail(steps.failure_output(label))
+        if not blocking:
             steps.defer(label, len(deferred))
+            return
+        report.new_findings(label, blocking, known, detail=detail)
+        if deferred:
+            steps.deferred[label] = len(deferred)
+            print(f"[verify] {label}: {len(deferred)} more deferred")
+        steps.settle(label, ok=False)
         return
     if fresh:
         report.new_findings(label, fresh, known, detail=detail)
@@ -480,6 +489,7 @@ def _test_step(
         steps.settle("tests", ok=True)
         return
     if draft.show:
+        _print_tail(steps.failure_output("tests"))
         report.test_failures(cfg)
     steps.defer("tests", None)
 
@@ -643,14 +653,21 @@ def _indented(paths: list[str] | tuple[str, ...]) -> None:
 
 
 def _finish(steps: Steps, draft: bool = False) -> int:
+    deferred = _deferred_summary(steps) if draft else ""
     if steps.failures:
-        print(f"[verify] FAILED in {steps.seconds:.1f}s")
+        also = f" (draft; also deferred: {deferred})" if deferred else ""
+        print(f"[verify] FAILED{also} in {steps.seconds:.1f}s")
         print(f"[verify] failed: {', '.join(steps.failures)}")
         return 1
-    if draft:
-        print(f"[verify] ok (draft; {_deferred_summary(steps)}) in {steps.seconds:.1f}s")
-    else:
+    if not draft:
         print(f"[verify] ok in {steps.seconds:.1f}s")
+    elif deferred:
+        print(
+            f"[verify] ok (draft; deferred: {deferred} - they block at commit, nothing to do now)"
+            f" in {steps.seconds:.1f}s"
+        )
+    else:
+        print(f"[verify] ok (draft; nothing deferred) in {steps.seconds:.1f}s")
     return 0
 
 
@@ -659,7 +676,7 @@ def _plural(count: int, word: str) -> str:
 
 
 def _deferred_summary(steps: Steps) -> str:
-    """The deferred part of the draft tail: findings and whole steps, never mixed."""
+    """What a draft run deferred, findings and whole steps never mixed; ``""`` for none."""
     counted = {label: count for label, count in steps.deferred.items() if count}
     parts: list[str] = []
     if counted:
@@ -668,9 +685,7 @@ def _deferred_summary(steps: Steps) -> str:
     if steps.deferred_steps:
         names = ", ".join(steps.deferred_steps)
         parts.append(f"{_plural(len(steps.deferred_steps), 'step')} ({names})")
-    if not parts:
-        return "nothing deferred"
-    return f"deferred: {', '.join(parts)} - they block at commit, nothing to do now"
+    return ", ".join(parts)
 
 
 def _cache_key(cfg: Config, args: argparse.Namespace) -> str | None:
@@ -741,9 +756,10 @@ def _quiet(cfg: Config, entries: dict[str, set[str]] | None, draft: Draft | None
 
     With parsed findings devloop reprints what matters; in draft a step that
     does not block is silenced entirely, so its output cannot read as a failure.
+    ``--show-deferred`` reprints a deferred step's output, never a passing one's.
     """
-    quiet = {"ruff", "format", "mypy"} if entries is not None else set()
-    if draft is not None and not draft.show:
+    quiet = set(PARSED_STEPS) if entries is not None else set()
+    if draft is not None:
         candidates = {"quality", "policy", "tests", *(spec.name for spec in cfg.checks)}
         quiet |= candidates - draft.blocking.steps
     return frozenset(quiet)

@@ -1933,6 +1933,32 @@ class DraftPipelineTest(unittest.TestCase):
         self.assertIn("long@pkg/module.py", shown)
         self.assertIn("README missing", shown)
 
+    def test_show_deferred_prints_a_deferred_step_once(self) -> None:
+        _, text = self._check(self._draft(show_deferred=True), policy_red=True)
+        self.assertEqual(text.count("README missing"), 1, text)
+
+    def test_show_deferred_keeps_passing_steps_quiet(self) -> None:
+        _, text = self._check(self._draft(show_deferred=True))
+        self.assertNotIn("quality says x", text)
+        self.assertNotIn("README missing", text)
+
+    def test_a_step_that_blocks_still_counts_what_it_deferred(self) -> None:
+        self.cfg = fake_config(
+            self.root, policy=self.root / "policy.py", draft_blocking=("ruff:F841",)
+        )
+        code, text = self._check(self._draft(), ruff=ruff_json("F841", "F401"))
+        self.assertEqual(code, 1)
+        self.assertIn("ruff: 1 new finding(s) against the baseline", text)
+        self.assertIn("ruff: 1 more deferred", text)
+        self.assertIn("FAILED (draft; also deferred: 1 finding (ruff 1))", text)
+
+    def test_a_failed_draft_run_names_what_it_deferred(self) -> None:
+        code, text = self._check(self._draft(), unformatted=True, tests_red=True)
+        self.assertEqual(code, 1)
+        lines = text.rstrip().splitlines()
+        self.assertTrue(lines[-2].startswith("[verify] FAILED (draft; also deferred: 1 finding"))
+        self.assertEqual(lines[-1], "[verify] failed: tests")
+
     def test_a_syntax_error_blocks(self) -> None:
         code, text = self._check(self._draft(), ruff=ruff_json("invalid-syntax"))
         self.assertEqual(code, 1)

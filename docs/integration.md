@@ -451,8 +451,14 @@ Every other finding is deferred. The step prints a neutral line instead of
 [verify] ok (draft; deferred: 9 findings (quality 4, mypy 3, ruff 2), 1 step (policy) - they block at commit, nothing to do now) in 3.1s
 ```
 
-`--show-deferred` prints the deferred findings and the captured output;
-`--explain` keeps meaning the test selection.
+A run that does fail names what it deferred as well, so the total is visible
+before the first green run: `[verify] FAILED (draft; also deferred: 6 findings
+(...)) in 1.5s`, then `failed: <steps>`. A step with both kinds of findings
+prints its blocking findings and `<step>: N more deferred`.
+
+`--show-deferred` prints the deferred findings and the captured output of the
+deferred steps; passing steps stay quiet. `--explain` keeps meaning the test
+selection.
 
 The mode comes from the first source that names one: `--mode`, `DEVLOOP_MODE`,
 the pin in `<cache_dir>/mode`, then `modes.default`. Three rules keep draft

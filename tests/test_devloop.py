@@ -1958,7 +1958,7 @@ class DraftPipelineTest(unittest.TestCase):
         )
         code, text = self._check(self._draft(), ruff=ruff_json("F841", "F401"))
         self.assertEqual(code, 1)
-        self.assertIn("ruff: 1 new finding(s) against the baseline", text)
+        self.assertIn("ruff: 1 finding(s) block the draft run", text)
         self.assertIn("ruff: 1 more deferred", text)
         self.assertIn("FAILED (draft; also deferred: 1 finding (ruff 1))", text)
 
@@ -2021,6 +2021,20 @@ class DraftPipelineTest(unittest.TestCase):
         code, text = self._check(self._draft(), ruff=ruff_json("F821", "F401"))
         self.assertEqual(code, 1)
         self.assertIn("msg F821", text)
+
+    def test_without_a_baseline_the_verdict_claims_no_comparison(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821", "F401"))
+        self.assertEqual(code, 1)
+        self.assertIn("[verify] ruff: 1 finding(s) block the draft run", text)
+        self.assertIn("[verify] ruff: 1 more deferred", text)
+        self.assertNotIn("against the baseline", text)
+
+    def test_with_a_baseline_the_verdict_names_it(self) -> None:
+        path = self.root / "devloop-baseline.json"
+        baseline.save(path, {})
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py", baseline=path)
+        _, text = self._check(self._draft(), ruff=ruff_json("F821"))
+        self.assertIn("[verify] ruff: 1 new finding(s) against the baseline", text)
 
     def test_a_blocking_finding_does_not_skip_the_later_steps(self) -> None:
         code, text = self._check(self._draft(), ruff=ruff_json("F821"), unformatted=True)

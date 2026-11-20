@@ -279,6 +279,7 @@ class Draft:
 
     blocking: mode.Blocking
     show: bool = False
+    baseline: bool = True
 
 
 def _settle(
@@ -313,7 +314,7 @@ def _settle(
         if not blocking:
             steps.defer(label, len(deferred))
             return
-        report.new_findings(label, blocking, known, detail=detail)
+        report.new_findings(label, blocking, known, detail=detail, compared=draft.baseline)
         if deferred:
             steps.deferred[label] = len(deferred)
             print(f"[verify] {label}: {len(deferred)} more deferred")
@@ -762,7 +763,9 @@ def run_check(args: argparse.Namespace) -> int:
     entries = _baseline_entries(cfg)
     draft: Draft | None = None
     if current.draft:
-        draft = Draft(mode.Blocking.parse(cfg.draft_blocking), args.show_deferred)
+        draft = Draft(
+            mode.Blocking.parse(cfg.draft_blocking), args.show_deferred, entries is not None
+        )
         entries = {} if entries is None else entries
     # Draft keeps going past a blocking finding: the deferred total stays complete
     # and the tests still report, so "tests: not run" never appears in draft.

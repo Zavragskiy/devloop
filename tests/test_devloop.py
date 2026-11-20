@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from devloop import __version__ as devloop_version  # noqa: E402
 from devloop import (  # noqa: E402
     baseline,
     cli,
@@ -23,6 +24,7 @@ from devloop import (  # noqa: E402
     gitinfo,
     graph,
     impact,
+    mode,
     process,
     report,
     selector,
@@ -69,6 +71,9 @@ def fake_args(**overrides) -> argparse.Namespace:
         "explain": False,
         "changed_only": False,
         "check": False,
+        "mode": None,
+        "value": None,
+        "show_deferred": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -446,6 +451,7 @@ class RecordingSteps:
         self.reported = dict(reported or {})
         self.verdicts: dict[str, bool] = {}
         self.ran: set[str] = set()
+        self.unparsed: set[str] = set()
         self.keep_going = keep_going
 
     @property
@@ -1705,6 +1711,438 @@ class ProcessDecodingTest(unittest.TestCase):
         with patch("devloop.process.locale.getpreferredencoding", return_value="cp1251"):
             text = process.decode(b"\xff\xfe\x98")
         self.assertIsInstance(text, str)
+
+
+NO_MODE_ENV = {"CI": "", mode.ENV: ""}
+
+
+def ruff_json(*codes: str, path: str = "pkg/module.py") -> str:
+    return json.dumps(
+        [
+            {"code": code, "filename": path, "location": {"row": 1}, "message": f"msg {code}"}
+            for code in codes
+        ]
+    )
+
+
+class ModeConfigTest(unittest.TestCase):
+    """``[tool.devloop.modes]`` is validated, so a typo cannot switch a gate off."""
+
+    def _load(self, modes: str, checks: str = "") -> config.Config:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        write(
+            root,
+            "pyproject.toml",
+            f'[tool.devloop]\nsource_roots = ["pkg"]\n{checks}\n[tool.devloop.modes]\n{modes}\n',
+        )
+        return config.load(root)
+
+    def test_the_default_blocks_undefined_names_and_tests(self) -> None:
+        cfg = self._load("")
+        self.assertEqual(cfg.mode_default, "strict")
+        self.assertEqual(cfg.draft_blocking, ("ruff:F821,F822,F823", "tests"))
+
+    def test_an_empty_list_is_the_explicit_opt_out(self) -> None:
+        self.assertEqual(self._load("draft_blocking = []").draft_blocking, ())
+
+    def test_an_unknown_step_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown step 'qualty'"):
+            self._load('draft_blocking = ["qualty"]')
+
+    def test_only_ruff_takes_code_prefixes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only ruff takes code prefixes"):
+            self._load('draft_blocking = ["mypy:attr-defined"]')
+
+    def test_a_malformed_selector_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "needs ruff code prefixes"):
+            self._load('draft_blocking = ["ruff:"]')
+
+    def test_a_step_listed_twice_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "listed twice"):
+            self._load('draft_blocking = ["ruff", "ruff:F821"]')
+
+    def test_a_project_check_is_a_known_step(self) -> None:
+        check = '[[tool.devloop.check]]\nname = "plan-run"\ncommand = ["x"]\n'
+        cfg = self._load('draft_blocking = ["plan-run"]', check)
+        self.assertEqual(cfg.draft_blocking, ("plan-run",))
+
+    def test_an_unknown_default_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "default must be one of"):
+            self._load('default = "loose"')
+
+
+class ModeResolutionTest(unittest.TestCase):
+    """Flag, then environment, then the pinned file, then the configured default."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.cfg = fake_config(Path(self._temp.name).resolve())
+
+    def test_the_first_source_that_names_a_mode_wins(self) -> None:
+        mode.write_file(self.cfg, "draft")
+        self.assertEqual(mode.resolve(self.cfg, None, environ={}), mode.Mode("draft", "file"))
+        env = {mode.ENV: "strict"}
+        self.assertEqual(mode.resolve(self.cfg, None, environ=env).source, mode.ENV)
+        self.assertEqual(mode.resolve(self.cfg, "draft", environ=env).source, "--mode")
+
+    def test_the_default_is_quiet_strict(self) -> None:
+        current = mode.resolve(self.cfg, None, environ={})
+        self.assertEqual(current, mode.Mode("strict", "default"))
+        self.assertTrue(current.quiet_default)
+
+    def test_full_refuses_an_explicit_draft(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--full is always strict"):
+            mode.resolve(self.cfg, "draft", full=True, environ={})
+
+    def test_full_overrides_a_pinned_draft_and_says_so(self) -> None:
+        mode.write_file(self.cfg, "draft")
+        current = mode.resolve(self.cfg, None, full=True, environ={})
+        self.assertEqual(current.header, "mode: strict (--full; draft from file ignored)")
+
+    def test_ci_is_strict_whatever_the_source(self) -> None:
+        current = mode.resolve(self.cfg, "draft", environ={"CI": "true"})
+        self.assertEqual(current.header, "mode: strict (CI; draft from --mode ignored)")
+        configured = fake_config(self.cfg.root, mode_default="draft")
+        self.assertEqual(mode.resolve(configured, None, environ={"CI": "1"}).name, "strict")
+
+    def test_a_corrupt_pin_is_an_error(self) -> None:
+        write(self.cfg.cache_dir, "mode", "loose\n")
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            mode.resolve(self.cfg, None, environ={})
+
+    def test_default_removes_the_pin(self) -> None:
+        mode.write_file(self.cfg, "draft")
+        mode.write_file(self.cfg, None)
+        self.assertIsNone(mode.read_file(self.cfg))
+
+
+class BlockingRuleTest(unittest.TestCase):
+    """In draft a syntax error always blocks; the rest follows ``draft_blocking``."""
+
+    def _finding(self, step: str, code: str) -> findings.Finding:
+        return findings.Finding(step, f"pkg/module.py:{code}", code)
+
+    def test_ruff_codes_match_by_prefix_and_syntax_always_blocks(self) -> None:
+        rule = mode.Blocking.parse(config.DRAFT_BLOCKING)
+        self.assertTrue(rule.blocks("ruff", self._finding("ruff", "F821")))
+        self.assertTrue(rule.blocks("ruff", self._finding("ruff", "invalid-syntax")))
+        self.assertFalse(rule.blocks("ruff", self._finding("ruff", "F401")))
+        self.assertFalse(rule.blocks("mypy", self._finding("mypy", "attr-defined")))
+
+    def test_an_empty_rule_still_blocks_syntax(self) -> None:
+        rule = mode.Blocking.parse(())
+        self.assertTrue(rule.blocks("ruff", self._finding("ruff", "invalid-syntax")))
+        self.assertFalse(rule.blocks("ruff", self._finding("ruff", "F821")))
+
+    def test_a_whole_step_blocks_every_finding(self) -> None:
+        rule = mode.Blocking.parse(("mypy",))
+        self.assertTrue(rule.blocks("mypy", self._finding("mypy", "attr-defined")))
+
+    def test_a_prefix_that_names_no_rule_is_reported(self) -> None:
+        rule = mode.Blocking.parse(("ruff:F821,Z9,F83",))
+        self.assertEqual(mode.unmatched_prefixes(rule, ["F821", "F841", "E501"]), ["Z9", "F83"])
+
+
+class DraftPipelineTest(unittest.TestCase):
+    """A draft ``check`` runs every step and fails only on what breaks the code."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        write(self.root, "pkg/module.py", "")
+        write(self.root, "tests/test_a.py", "")
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py")
+        self.ran: list[str] = []
+
+    def _fake_run(self, scenario: dict[str, object]):
+        def run(command, cwd=None, env=None):
+            if command[1:4] == ["-m", "ruff", "check"]:
+                self.ran.append("ruff")
+                # The parsed invocation passes --exit-zero; a plain strict run
+                # does not, so its exit code can still fail the step.
+                parsed = "--exit-zero" in command
+                code = 0 if parsed else int(scenario.get("ruff_exit", 0))
+                return subprocess.CompletedProcess(command, code, scenario.get("ruff", "[]"), "")
+            if command[1:4] == ["-m", "ruff", "format"]:
+                self.ran.append("format")
+                text = "Would reformat: pkg/module.py\n" if scenario.get("unformatted") else ""
+                return subprocess.CompletedProcess(command, 1 if text else 0, text, "")
+            if command[1:3] == ["-m", "mypy"]:
+                self.ran.append("mypy")
+                text = str(scenario.get("mypy", ""))
+                return subprocess.CompletedProcess(command, 1 if text else 0, text, "")
+            if str(self.cfg.quality) in command:
+                self.ran.append("quality")
+                keys = list(scenario.get("quality", []))  # type: ignore[call-overload]
+                if keys:
+                    report_file = Path(env["DEVLOOP_FINDINGS_FILE"])
+                    report_file.parent.mkdir(parents=True, exist_ok=True)
+                    lines = "".join(json.dumps({"key": key}) + "\n" for key in keys)
+                    report_file.write_text(lines, encoding="utf-8")
+                failed = bool(keys) or scenario.get("quality_crash")
+                return subprocess.CompletedProcess(
+                    command, 1 if failed else 0, "quality says x", ""
+                )
+            if str(self.cfg.policy) in command:
+                self.ran.append("policy")
+                code = 1 if scenario.get("policy_red") else 0
+                return subprocess.CompletedProcess(command, code, "policy: README missing\n", "")
+            self.ran.append("tests")
+            code = 1 if scenario.get("tests_red") else 0
+            return subprocess.CompletedProcess(command, code, "tests ran\n", "")
+
+        return run
+
+    def _check(self, args: argparse.Namespace, **scenario: object) -> tuple[int, str]:
+        output = StringIO()
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch("devloop.cli.gitinfo.collect", return_value=[Change("pkg/module.py", " M")]),
+            patch.object(cli.process, "run", side_effect=self._fake_run(scenario)),
+            patch.dict("os.environ", NO_MODE_ENV),
+            redirect_stdout(output),
+        ):
+            code = cli.run_check(args)
+        return code, output.getvalue()
+
+    def _draft(self, **overrides: object) -> argparse.Namespace:
+        return fake_args(mode="draft", files=["tests/test_a.py"], **overrides)
+
+    def test_deferred_findings_do_not_stop_the_run_or_the_tests(self) -> None:
+        code, text = self._check(
+            self._draft(),
+            ruff=ruff_json("F401", "F841"),
+            unformatted=True,
+            mypy="pkg/module.py:1: error: Bad  [attr-defined]\n",
+            quality=["long@pkg/module.py"],
+            policy_red=True,
+        )
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.ran, ["ruff", "format", "quality", "policy", "mypy", "tests"])
+        self.assertNotIn("FAILED", text)
+        self.assertIn("[verify] mode: draft (--mode)", text)
+        self.assertIn("[verify] quality: 1 deferred", text)
+        self.assertIn("[verify] policy: deferred", text)
+        last = text.rstrip().splitlines()[-1]
+        self.assertTrue(last.startswith("[verify] ok (draft; deferred: 5 findings"), last)
+        self.assertIn("(ruff 2, format 1, quality 1, mypy 1), 1 step (policy)", last)
+        self.assertIn("nothing to do now", last)
+
+    def test_deferred_output_is_silent_unless_asked(self) -> None:
+        _, quiet = self._check(self._draft(), quality=["long@pkg/module.py"], policy_red=True)
+        self.assertNotIn("quality says x", quiet)
+        self.assertNotIn("README missing", quiet)
+        self.assertNotIn("long@pkg/module.py", quiet)
+        _, shown = self._check(
+            self._draft(show_deferred=True), quality=["long@pkg/module.py"], policy_red=True
+        )
+        self.assertIn("long@pkg/module.py", shown)
+        self.assertIn("README missing", shown)
+
+    def test_show_deferred_prints_a_deferred_step_once(self) -> None:
+        _, text = self._check(self._draft(show_deferred=True), policy_red=True)
+        self.assertEqual(text.count("README missing"), 1, text)
+
+    def test_show_deferred_keeps_passing_steps_quiet(self) -> None:
+        _, text = self._check(self._draft(show_deferred=True))
+        self.assertNotIn("quality says x", text)
+        self.assertNotIn("README missing", text)
+
+    def test_a_step_that_blocks_still_counts_what_it_deferred(self) -> None:
+        self.cfg = fake_config(
+            self.root, policy=self.root / "policy.py", draft_blocking=("ruff:F841",)
+        )
+        code, text = self._check(self._draft(), ruff=ruff_json("F841", "F401"))
+        self.assertEqual(code, 1)
+        self.assertIn("ruff: 1 finding(s) block the draft run", text)
+        self.assertIn("ruff: 1 more deferred", text)
+        self.assertIn("FAILED (draft; also deferred: 1 finding (ruff 1))", text)
+
+    def test_a_failed_draft_run_names_what_it_deferred(self) -> None:
+        code, text = self._check(self._draft(), unformatted=True, tests_red=True)
+        self.assertEqual(code, 1)
+        lines = text.rstrip().splitlines()
+        self.assertTrue(lines[-2].startswith("[verify] FAILED (draft; also deferred: 1 finding"))
+        self.assertEqual(lines[-1], "[verify] failed: tests")
+
+    def test_strict_with_a_baseline_skips_tests_on_a_syntax_error(self) -> None:
+        path = self.root / "devloop-baseline.json"
+        baseline.save(path, {})
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py", baseline=path)
+        code, text = self._check(
+            fake_args(files=["tests/test_a.py"], keep_going=True),
+            ruff=ruff_json("invalid-syntax"),
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("mode:", text)
+        self.assertNotIn("tests", self.ran)
+        self.assertIn("[verify] tests: not run, a file does not parse", text)
+        self.assertNotIn("a static step failed", text)
+
+    def test_strict_without_a_baseline_still_runs_the_tests(self) -> None:
+        code, text = self._check(
+            fake_args(files=["tests/test_a.py"], keep_going=True),
+            ruff=ruff_json("invalid-syntax"),
+            ruff_exit=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("tests", self.ran)
+        self.assertNotIn("a file does not parse", text)
+
+    def test_a_syntax_error_blocks_and_skips_what_cannot_parse(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("invalid-syntax"))
+        self.assertEqual(code, 1)
+        self.assertIn("failed: ruff", text)
+        self.assertNotIn("format", self.ran)
+        self.assertNotIn("tests", self.ran)
+        self.assertIn("[verify] format: skipped 1 unparsed file", text)
+        self.assertIn("[verify] tests: not run, a file does not parse", text)
+        self.assertNotIn("the tool failed without a finding", text)
+
+    def test_format_still_checks_the_files_that_parse(self) -> None:
+        steps = RecordingSteps(outputs={"ruff": ruff_json("invalid-syntax")}, keep_going=True)
+        cli._static_steps(
+            self.cfg,
+            steps,
+            ["pkg/module.py", "pkg/other.py"],
+            full=False,
+            entries={},
+        )
+        formatted = [command for label, command in steps.commands if label == "format"]
+        self.assertEqual(len(formatted), 1)
+        self.assertNotIn("pkg/module.py", formatted[0])
+        self.assertIn("pkg/other.py", formatted[0])
+
+    def test_an_undefined_name_blocks_by_default(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821", "F401"))
+        self.assertEqual(code, 1)
+        self.assertIn("msg F821", text)
+
+    def test_without_a_baseline_the_verdict_claims_no_comparison(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821", "F401"))
+        self.assertEqual(code, 1)
+        self.assertIn("[verify] ruff: 1 finding(s) block the draft run", text)
+        self.assertIn("[verify] ruff: 1 more deferred", text)
+        self.assertNotIn("against the baseline", text)
+
+    def test_with_a_baseline_the_verdict_names_it(self) -> None:
+        path = self.root / "devloop-baseline.json"
+        baseline.save(path, {})
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py", baseline=path)
+        _, text = self._check(self._draft(), ruff=ruff_json("F821"))
+        self.assertIn("[verify] ruff: 1 new finding(s) against the baseline", text)
+
+    def test_a_blocking_finding_does_not_skip_the_later_steps(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821"), unformatted=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.ran, ["ruff", "format", "quality", "policy", "mypy", "tests"])
+        self.assertNotIn("tests: not run", text)
+        self.assertIn("FAILED (draft; also deferred: 1 finding (format 1))", text)
+
+    def test_a_failed_draft_run_without_deferred_work_still_says_draft(self) -> None:
+        code, text = self._check(self._draft(), ruff=ruff_json("F821"))
+        self.assertEqual(code, 1)
+        self.assertIn("[verify] FAILED (draft) in", text)
+
+    def test_a_tool_that_fails_without_a_finding_stays_blocking(self) -> None:
+        code, text = self._check(self._draft(), quality_crash=True)
+        self.assertEqual(code, 1)
+        self.assertIn("quality: the tool failed without a finding", text)
+
+    def test_failing_tests_block_by_default(self) -> None:
+        code, text = self._check(self._draft(), tests_red=True)
+        self.assertEqual(code, 1)
+        self.assertIn("failed: tests", text)
+
+    def test_tests_left_out_of_the_rule_are_a_deferred_step(self) -> None:
+        self.cfg = fake_config(self.root, policy=self.root / "policy.py", draft_blocking=())
+        code, text = self._check(self._draft(), tests_red=True)
+        self.assertEqual(code, 0, text)
+        self.assertIn("1 step (tests)", text)
+        self.assertNotIn("tests ran", text)
+
+    def test_strict_fails_on_the_same_tree(self) -> None:
+        code, text = self._check(fake_args(files=["tests/test_a.py"]), unformatted=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn("mode:", text)
+        self.assertIn("failed: format", text)
+
+    def test_a_clean_draft_run_says_nothing_is_deferred(self) -> None:
+        code, text = self._check(self._draft())
+        self.assertEqual(code, 0)
+        self.assertIn("[verify] ok (draft; nothing deferred)", text)
+
+    def test_full_ignores_a_pinned_draft(self) -> None:
+        mode.write_file(self.cfg, "draft")
+        args = fake_args(full=True, no_tests=True, no_cache=True)
+        with patch("devloop.cli._all_python", return_value=["pkg/module.py"]):
+            code, text = self._check(args, unformatted=True)
+        self.assertEqual(code, 1)
+        self.assertIn("mode: strict (--full; draft from file ignored)", text)
+        self.assertIn("failed: format", text)
+
+
+class ModeCommandTest(unittest.TestCase):
+    """``devloop mode`` pins the checkout; ``baseline`` refuses to freeze a draft."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+        self.cfg = fake_config(self.root, baseline=self.root / "devloop-baseline.json")
+
+    def _main(self, *argv: str, rules: str = '[{"code": "F821"}]') -> tuple[int, str, str]:
+        output, errors = StringIO(), StringIO()
+        listed = subprocess.CompletedProcess([], 0, rules, "")
+        with (
+            patch("devloop.cli.config.load", return_value=self.cfg),
+            patch.object(cli.process, "run", return_value=listed),
+            patch.dict("os.environ", NO_MODE_ENV),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            code = cli.main(list(argv))
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_mode_names_the_installed_build_and_an_unknown_prefix(self) -> None:
+        code, text, _ = self._main("mode", rules='[{"code": "F821"}, {"code": "F822"}]')
+        self.assertEqual(code, 0)
+        self.assertIn(f"devloop: {devloop_version}", text)
+        self.assertIn("ruff:F823 matches no ruff rule", text)
+        self.assertNotIn("ruff:F821 matches", text)
+
+    def test_an_unreadable_rule_list_is_said_not_guessed(self) -> None:
+        _, text, _ = self._main("mode", rules="not json")
+        self.assertIn("could not list the ruff rules", text)
+
+    def test_mode_pins_prints_the_chain_and_unpins(self) -> None:
+        code, text, _ = self._main("mode", "draft")
+        self.assertEqual(code, 0)
+        self.assertIn("[verify] mode: draft (file)", text)
+        self.assertIn("cache/mode: draft", text)
+        self.assertEqual(mode.read_file(self.cfg), "draft")
+        self._main("mode", "default")
+        self.assertIsNone(mode.read_file(self.cfg))
+
+    def test_baseline_is_refused_in_draft_and_names_the_source(self) -> None:
+        mode.write_file(self.cfg, "draft")
+        code, _, errors = self._main("baseline")
+        self.assertEqual(code, 2)
+        self.assertIn("baseline is refused: mode draft via cache/mode", errors)
+        self.assertFalse(self.cfg.baseline.exists())  # type: ignore[union-attr]
+
+    def test_full_with_an_explicit_draft_is_an_error(self) -> None:
+        code, _, errors = self._main("check", "--full", "--mode", "draft")
+        self.assertEqual(code, 2)
+        self.assertIn("--full is always strict", errors)
+
+    def test_a_mode_value_belongs_to_the_mode_command(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            cli.main(["check", "draft"])
 
 
 if __name__ == "__main__":

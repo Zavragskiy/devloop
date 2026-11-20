@@ -62,20 +62,40 @@ def _log_tail(cfg: Config, log: str) -> None:
         print(f"  {line}")
 
 
-def new_findings(step: str, fresh: list[Finding], known: int, *, detail: bool = False) -> None:
+def new_findings(
+    step: str,
+    fresh: list[Finding],
+    known: int,
+    *,
+    detail: bool = False,
+    compared: bool = True,
+) -> None:
     """Print the findings a baseline does not cover and the step's verdict.
 
     A project's own command prints its findings itself, so only the key is
     repeated here; the built-in tools keep their message, which carries the line.
+    ``compared`` is false for a draft run without a baseline file, where no
+    comparison happened and "new" would claim one.
     """
     for finding in fresh[:FINDINGS_TAIL]:
         print(f"  {finding.message}  ({finding.key})" if detail else f"  {finding.key}")
     if len(fresh) > FINDINGS_TAIL:
         print(f"  ... and {len(fresh) - FINDINGS_TAIL} more")
-    if fresh:
+    if fresh and not compared:
+        print(f"[verify] {step}: {len(fresh)} finding(s) block the draft run")
+    elif fresh:
         print(f"[verify] {step}: {len(fresh)} new finding(s) against the baseline")
     else:
         print(f"[verify] {step}: 0 new findings, {known} baselined")
+
+
+def deferred_findings(step: str, deferred: list[Finding], *, detail: bool = False) -> None:
+    """Print what a draft run deferred, for ``--show-deferred`` only."""
+    print(f"[verify] {step}: deferred until --full:")
+    for finding in deferred[:FINDINGS_TAIL]:
+        print(f"  {finding.message}  ({finding.key})" if detail else f"  {finding.key}")
+    if len(deferred) > FINDINGS_TAIL:
+        print(f"  ... and {len(deferred) - FINDINGS_TAIL} more")
 
 
 def stale_entries(step: str, stale: list[str]) -> None:
